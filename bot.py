@@ -3,24 +3,31 @@ import re
 import json
 import html
 import time
+import logging
 import asyncio
 import urllib.parse
-import urllib.request
-import urllib.error
 
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from ollama import chat
 from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "qwen3:14b")
 LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "gemma3:12b")
 CLOUD_MODEL = os.getenv("CLOUD_MODEL", "kimi-k2.5:cloud")
 SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", "gemini-2.5-flash")
+SEARCH_RETRIEVAL_MODEL = os.getenv("SEARCH_RETRIEVAL_MODEL", SEARCH_PLANNER_MODEL)
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot_username")
 
 MAX_TELEGRAM_CHUNK = 3500
@@ -34,7 +41,6 @@ FINAL_TIMEOUT_SECONDS = int(os.getenv("FINAL_TIMEOUT_SECONDS", "600"))
 SEARCH_QUERY_LIMIT = int(os.getenv("SEARCH_QUERY_LIMIT", "6"))
 SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "8"))
 TOTAL_CANDIDATE_LIMIT = int(os.getenv("TOTAL_CANDIDATE_LIMIT", "40"))
-FETCH_URL_LIMIT = int(os.getenv("FETCH_URL_LIMIT", "8"))
 SEARCH_SNIPPET_LIMIT = int(os.getenv("SEARCH_SNIPPET_LIMIT", "280"))
 FETCH_CONTENT_LIMIT = int(os.getenv("FETCH_CONTENT_LIMIT", "900"))
 
@@ -43,6 +49,7 @@ MEMORY_QUESTION_CHARS = int(os.getenv("MEMORY_QUESTION_CHARS", "1200"))
 MEMORY_ANSWER_CHARS = int(os.getenv("MEMORY_ANSWER_CHARS", "5000"))
 
 CHAT_MEMORY = {}
+CHAT_LOCKS = {}
 
 LOCAL_SYSTEM_PROMPT = """You are a helpful technical assistant.
 
@@ -178,8 +185,20 @@ def get_gemini_client():
     return genai.Client()
 
 
+def get_grounding_tool():
+    return types.Tool(google_search=types.GoogleSearch())
+
+
 def get_chat_history(chat_id: int):
     return CHAT_MEMORY.get(chat_id, [])
+
+
+def get_chat_lock(chat_id: int) -> asyncio.Lock:
+    lock = CHAT_LOCKS.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        CHAT_LOCKS[chat_id] = lock
+    return lock
 
 
 def save_chat_turn(chat_id: int, question: str, final_answer: str) -> None:
@@ -197,6 +216,7 @@ def save_chat_turn(chat_id: int, question: str, final_answer: str) -> None:
 
 def clear_chat_history(chat_id: int) -> None:
     CHAT_MEMORY.pop(chat_id, None)
+    CHAT_LOCKS.pop(chat_id, None)
 
 
 def format_recent_chat_context(chat_id: int) -> str:
@@ -286,53 +306,67 @@ CURRENT USER QUESTION:
     }
 
 
-def ollama_api_post(path: str, payload: dict) -> dict:
-    api_key = os.getenv("OLLAMA_API_KEY")
-    if not api_key:
-        raise RuntimeError("OLLAMA_API_KEY is not set.")
+def gemini_grounded_search(question: str, recent_chat_context: str, query_text: str, purpose: str) -> dict:
+    client = get_gemini_client()
+    prompt = f"""Use Google Search grounding to gather web evidence for one search angle.
 
-    url = f"https://ollama.com/api/{path}"
-    data = json.dumps(payload).encode("utf-8")
+Do not answer the user fully yet.
+Focus on collecting useful facts and relevant web sources for this search angle.
+Keep the response concise and factual.
 
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+RECENT CHAT CONTEXT:
+{recent_chat_context}
+
+CURRENT USER QUESTION:
+{question}
+
+SEARCH ANGLE:
+{query_text}
+
+PURPOSE:
+{purpose}
+"""
+
+    response = client.models.generate_content(
+        model=SEARCH_RETRIEVAL_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(tools=[get_grounding_tool()]),
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Ollama API HTTP {e.code}: {body}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Ollama API connection error: {e}")
+    candidates = getattr(response, "candidates", None) or []
+    grounding_metadata = None
+    if candidates:
+        grounding_metadata = getattr(candidates[0], "grounding_metadata", None)
 
+    web_search_queries = []
+    grounding_chunks = []
+    if grounding_metadata:
+        web_search_queries = getattr(grounding_metadata, "web_search_queries", None) or []
+        grounding_chunks = getattr(grounding_metadata, "grounding_chunks", None) or []
 
-def ollama_web_search(query: str, max_results: int = SEARCH_RESULTS_PER_QUERY) -> dict:
-    max_results = max(1, min(max_results, 10))
-    return ollama_api_post(
-        "web_search",
-        {
-            "query": query,
-            "max_results": max_results,
-        },
-    )
+    results = []
+    for chunk in grounding_chunks:
+        web = getattr(chunk, "web", None)
+        if not web:
+            continue
 
+        url = normalize_whitespace(getattr(web, "uri", "") or "")
+        if not url:
+            continue
 
-def ollama_web_fetch(url: str) -> dict:
-    return ollama_api_post(
-        "web_fetch",
-        {
-            "url": url,
-        },
-    )
+        results.append(
+            {
+                "title": normalize_whitespace(getattr(web, "title", "") or "") or "Untitled result",
+                "url": url,
+                "source": domain_from_url(url),
+            }
+        )
+
+    return {
+        "summary": truncate_text(normalize_whitespace(response.text or ""), FETCH_CONTENT_LIMIT),
+        "results": results[:SEARCH_RESULTS_PER_QUERY],
+        "executed_queries": [normalize_whitespace(item) for item in web_search_queries if normalize_whitespace(item)],
+    }
 
 
 def choose_fetch_candidates(query_buckets: list, fetch_limit: int) -> list:
@@ -367,7 +401,8 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
 
     all_candidates = []
     deduped_by_url = {}
-    query_buckets = []
+    search_errors = []
+    grounded_summaries = []
 
     for idx, query_item in enumerate(queries, start=1):
         query_text = normalize_whitespace(query_item.get("query", ""))
@@ -376,15 +411,29 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
         if not query_text:
             continue
 
-        search_response = ollama_web_search(query_text, SEARCH_RESULTS_PER_QUERY)
+        try:
+            search_response = gemini_grounded_search(question, recent_chat_context, query_text, purpose)
+        except Exception as e:
+            error_text = f"Q{idx} failed: {e}"
+            logger.warning("Search query failed for %r: %s", query_text, e)
+            search_errors.append(error_text)
+            continue
+
+        if search_response.get("summary"):
+            grounded_summaries.append(
+                {
+                    "query_index": idx,
+                    "query_text": query_text,
+                    "purpose": purpose,
+                    "summary": search_response["summary"],
+                    "executed_queries": search_response.get("executed_queries", []),
+                }
+            )
+
         raw_results = search_response.get("results", []) or []
-
-        bucket = []
-
         for rank, result in enumerate(raw_results, start=1):
             title = normalize_whitespace(result.get("title", ""))
             url = normalize_whitespace(result.get("url", ""))
-            snippet = truncate_text(normalize_whitespace(result.get("content", "")), SEARCH_SNIPPET_LIMIT)
 
             if not url:
                 continue
@@ -397,43 +446,15 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
                 "title": title or "Untitled result",
                 "url": url,
                 "source": domain_from_url(url),
-                "snippet": snippet,
+                "snippet": truncate_text(
+                    search_response.get("summary", ""),
+                    SEARCH_SNIPPET_LIMIT,
+                ),
             }
-
-            bucket.append(candidate)
 
             if url not in deduped_by_url and len(all_candidates) < TOTAL_CANDIDATE_LIMIT:
                 deduped_by_url[url] = candidate
                 all_candidates.append(candidate)
-
-        query_buckets.append(bucket)
-
-    fetch_candidates = choose_fetch_candidates(query_buckets, FETCH_URL_LIMIT)
-    fetched_pages = []
-
-    for item in fetch_candidates:
-        try:
-            fetched = ollama_web_fetch(item["url"])
-            fetched_pages.append(
-                {
-                    "source": item["source"],
-                    "title": normalize_whitespace(fetched.get("title", "")) or item["title"],
-                    "url": item["url"],
-                    "content": truncate_text(
-                        normalize_whitespace(fetched.get("content", "")),
-                        FETCH_CONTENT_LIMIT,
-                    ),
-                }
-            )
-        except Exception as e:
-            fetched_pages.append(
-                {
-                    "source": item["source"],
-                    "title": item["title"],
-                    "url": item["url"],
-                    "content": f"Fetch failed: {e}",
-                }
-            )
 
     lines = []
     lines.append("SEARCH OBJECTIVE")
@@ -450,6 +471,11 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
         lines.append(f"- Q{idx}: {query_item.get('query', '')}")
         lines.append(f"  Purpose: {query_item.get('purpose', '')}")
     lines.append("")
+    if search_errors:
+        lines.append("SEARCH WARNINGS")
+        for item in search_errors:
+            lines.append(f"- {item}")
+        lines.append("")
     lines.append("CANDIDATE RESULT POOL")
     if all_candidates:
         for idx, item in enumerate(all_candidates, start=1):
@@ -464,18 +490,16 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
         lines.append("- No search results collected.")
         lines.append("")
 
-    lines.append("FETCHED PAGE EXCERPTS")
-    if fetched_pages:
-        for idx, item in enumerate(fetched_pages, start=1):
-            lines.append(
-                f"[{idx:02d}] Source={item['source']} | Title={item['title']}"
-            )
-            lines.append(f"URL: {item['url']}")
-            if item["content"]:
-                lines.append(f"Excerpt: {item['content']}")
+    lines.append("GROUNDED QUERY SUMMARIES")
+    if grounded_summaries:
+        for idx, item in enumerate(grounded_summaries, start=1):
+            lines.append(f"[{idx:02d}] Query=Q{item['query_index']} | Purpose={item['purpose']}")
+            if item["executed_queries"]:
+                lines.append(f"Google queries: {', '.join(item['executed_queries'])}")
+            lines.append(f"Summary: {item['summary']}")
             lines.append("")
     else:
-        lines.append("- No page fetches completed.")
+        lines.append("- No grounded summaries collected.")
         lines.append("")
 
     return "\n".join(lines).strip()
@@ -586,7 +610,7 @@ def is_aligned_table_line(line: str) -> bool:
     if not stripped:
         return False
 
-    if stripped.startswith(("- ", "* ", "• ", "> ")):
+    if stripped.startswith(("- ", "* ", "> ")):
         return False
     if re.match(r"^\d+\.\s", stripped):
         return False
@@ -720,7 +744,9 @@ async def safe_edit_status_message(status_message, text: str) -> None:
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
             return
+        logger.warning("Could not edit status message: %s", e)
     except Exception:
+        logger.exception("Unexpected error while editing status message.")
         return
 
 
@@ -819,6 +845,8 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         )
 
         if plan_error or not plan:
+            if plan_error:
+                logger.warning("Falling back to default search plan: %s", plan_error)
             plan = default_search_plan(question)
 
         shared_pool, pool_error = await run_search_pool_step(
@@ -842,7 +870,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
                 + "\n".join(f"- {q['query']}" for q in plan.get("queries", []))
                 + "\n\nCANDIDATE RESULT POOL\n"
                 f"- Search pool generation failed: {pool_error}\n\n"
-                "FETCHED PAGE EXCERPTS\n"
+                "GROUNDED QUERY SUMMARIES\n"
                 "- None"
             )
 
@@ -891,6 +919,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         )
 
         if final_error:
+            logger.warning("Cloud synthesis failed, building fallback answer: %s", final_error)
             final_answer = build_fallback_answer(
                 question=question,
                 shared_pool=shared_pool,
@@ -918,13 +947,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(
         "Status: bot is running.\n"
         f"Search planner model: {SEARCH_PLANNER_MODEL}\n"
+        f"Search retrieval model: {SEARCH_RETRIEVAL_MODEL}\n"
         f"Local model 1: {LOCAL_MODEL_1}\n"
         f"Local model 2: {LOCAL_MODEL_2}\n"
         f"Cloud model: {CLOUD_MODEL}\n"
         f"Search query limit: {SEARCH_QUERY_LIMIT}\n"
         f"Search results per query: {SEARCH_RESULTS_PER_QUERY}\n"
         f"Total candidate limit: {TOTAL_CANDIDATE_LIMIT}\n"
-        f"Fetch URL limit: {FETCH_URL_LIMIT}\n"
         f"Rolling memory turns kept per chat: {MAX_HISTORY_TURNS}\n"
         f"Current chat memory count: {history_count}\n"
         f"Heartbeat interval: {HEARTBEAT_SECONDS}s\n"
@@ -949,21 +978,30 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     chat_id = update.effective_chat.id
     recent_chat_context = format_recent_chat_context(chat_id)
+    chat_lock = get_chat_lock(chat_id)
+
+    if chat_lock.locked():
+        await update.message.reply_text(
+            "A previous /ask is still running for this chat. Wait for it to finish or use /clear after it completes."
+        )
+        return
 
     status_message = await update.message.reply_text(
         "Working on it...\nStage: Starting...\nElapsed: 0s"
     )
 
-    try:
-        answer = await orchestrate_answer(user_text, recent_chat_context, status_message)
-        if not answer:
-            answer = "I didn't get a usable response."
-    except Exception as e:
-        await safe_edit_status_message(status_message, "Failed.")
-        answer = f"Error: {e}"
+    async with chat_lock:
+        try:
+            answer = await orchestrate_answer(user_text, recent_chat_context, status_message)
+            if not answer:
+                answer = "I didn't get a usable response."
+        except Exception as e:
+            logger.exception("Unhandled error while answering /ask.")
+            await safe_edit_status_message(status_message, "Failed.")
+            answer = f"Error: {e}"
 
-    save_chat_turn(chat_id, user_text, answer)
-    await send_formatted_answer(update, answer)
+        save_chat_turn(chat_id, user_text, answer)
+        await send_formatted_answer(update, answer)
 
 
 def main() -> None:

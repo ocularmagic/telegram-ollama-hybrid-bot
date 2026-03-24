@@ -8,3 +8,5 @@ venv/
 .vscode/
 logs/
 *.log
+start_bot.bat
+update_and_start_bot.bat

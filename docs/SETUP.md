@@ -21,12 +21,14 @@ Then, if you plan to use the default cloud synthesis model, sign in locally:
 ollama signin
 ```
 
-## 3. Pull the local models
+## 3. Pull the local models once
 
 ```bash
 ollama pull qwen3:14b
 ollama pull gemma3:12b
 ```
+
+You only need to do this the first time on a machine, or when you want to update or change models.
 
 ## 4. Get the required keys
 
@@ -34,7 +36,6 @@ You need:
 
 - `TELEGRAM_BOT_TOKEN`
 - `BOT_USERNAME`
-- `OLLAMA_API_KEY`
 - `GEMINI_API_KEY`
 
 ## 5. Install Python dependencies
@@ -52,13 +53,12 @@ Example variables:
 ```env
 TELEGRAM_BOT_TOKEN=...
 BOT_USERNAME=...
-OLLAMA_API_KEY=...
 GEMINI_API_KEY=...
 ```
 
 The bot loads `.env` automatically.
 
-## 7. Start Ollama
+## 7. Start Ollama each time you want to run the bot
 
 Make sure Ollama is running before you start the bot.
 

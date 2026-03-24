@@ -22,21 +22,21 @@ A single model can search and answer, but this project is meant to teach:
 
 ```text
 Telegram /ask
-  ↓
+  |
 Recent per-chat memory lookup
-  ↓
+  |
 Gemini search-plan generation
-  ↓
-Ollama web_search across multiple queries
-  ↓
-Shared candidate pool + fetched excerpts
-  ↓
+  |
+Gemini grounded Google Search across multiple queries
+  |
+Shared candidate pool + grounded summaries
+  |
 qwen3:14b local answer
-  ↓
+  |
 gemma3:12b local answer
-  ↓
+  |
 kimi-k2.5:cloud final synthesis
-  ↓
+  |
 Telegram response
 ```
 
@@ -58,7 +58,7 @@ That is a stronger default than letting every model search independently because
 
 Earlier versions used Gemini as the evidence summarizer.
 
-That was useful, but it compressed the search universe too early. The local models were often judging a **summary of the world**, not a larger pool of candidate sources.
+That was useful, but it compressed the search universe too early. The local models were often judging a summary of the world, not a larger pool of candidate sources.
 
 The current version uses Gemini to plan the search angles instead:
 
@@ -68,9 +68,9 @@ The current version uses Gemini to plan the search angles instead:
 - comparison/overview angle
 - follow-up resolution when prior context matters
 
-## Why Ollama web search is still in the loop
+## Why Gemini grounded search is in the loop
 
-Ollama’s web search API is a convenient way to run the retrieval layer while keeping the final model orchestration inside the Ollama ecosystem.
+Gemini's grounded Google Search is the retrieval layer in this repo. The bot relies on it to build the shared evidence pool before any model answers, and it also exposes the web sources used for each grounded search pass.
 
 ## Memory model
 
@@ -82,8 +82,8 @@ The bot keeps a small rolling memory per chat:
 
 This memory is:
 
-- **useful for follow-ups**
-- **not persistent** across restarts
+- useful for follow-ups
+- not persistent across restarts
 
 ## Output model roles
 
@@ -102,6 +102,6 @@ A final reconciler that sees:
 
 ## Important tradeoff
 
-This system is intentionally **slow but thoughtful**.
+This system is intentionally slow but thoughtful.
 
 Because the workflow is sequential, each `/ask` can run for several minutes under difficult conditions. The heartbeat/progress message is part of the design, not an afterthought.

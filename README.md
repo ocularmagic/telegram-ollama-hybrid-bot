@@ -2,15 +2,15 @@
 
 A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow.
 
-This repo is for builders who want to learn how a **hybrid local + cloud system** behaves in the real world, not just how to call one model once.
+This repo is for builders who want to learn how a hybrid local + cloud system behaves in the real world, not just how to call one model once.
 
 ## What it does
 
 When a user runs `/ask ...`, the bot:
 
 1. Uses **Gemini 2.5 Flash** to plan multiple search angles.
-2. Uses **Ollama web search** to collect a broad shared candidate pool.
-3. Fetches a small number of pages for extra context.
+2. Uses **Gemini grounded Google Search** to collect a broad shared candidate pool.
+3. Captures grounded query summaries and cited web sources for extra context.
 4. Sends the same evidence pool to **two local models**.
 5. Sends the evidence pool plus both local answers to **one cloud model**.
 6. Returns a final answer with staged progress updates in Telegram.
@@ -37,21 +37,21 @@ This is a good learning repo if you want hands-on experience with:
 
 ```text
 Telegram
-  ↓
+  |
 Command-only bot (/ask, /status, /clear)
-  ↓
+  |
 Gemini 2.5 Flash search planner
-  ↓
-Ollama web_search + web_fetch
-  ↓
+  |
+Gemini grounded Google Search
+  |
 Broad shared evidence pool
-  ↓            ↓
+  |            |
 qwen3:14b    gemma3:12b
-  ↓            ↓
+  |            |
 Independent local answers
-  ↓
+  |
 kimi-k2.5:cloud
-  ↓
+  |
 Final synthesis
 ```
 
@@ -61,7 +61,6 @@ Final synthesis
 - Ollama installed locally
 - A Telegram bot token from BotFather
 - A Gemini API key
-- An Ollama API key for Ollama web tools
 - Enough local hardware to run your chosen local models
 
 If you keep the default final model as `kimi-k2.5:cloud`, sign in locally with:
@@ -109,19 +108,20 @@ Minimum required variables:
 
 - `TELEGRAM_BOT_TOKEN`
 - `BOT_USERNAME`
-- `OLLAMA_API_KEY`
 - `GEMINI_API_KEY`
 
 The bot now loads `.env` automatically at startup.
 
-### 5. Pull the default local models
+### 5. Pull the default local models once
 
 ```bash
 ollama pull qwen3:14b
 ollama pull gemma3:12b
 ```
 
-### 6. Start Ollama
+You only need to do this the first time on a machine, or later if you want to update or replace models.
+
+### 6. Start Ollama each time you want to run the bot
 
 Make sure the Ollama app is running, or start the server manually:
 
@@ -192,7 +192,6 @@ Useful knobs in `bot.py`:
 - `SEARCH_QUERY_LIMIT`
 - `SEARCH_RESULTS_PER_QUERY`
 - `TOTAL_CANDIDATE_LIMIT`
-- `FETCH_URL_LIMIT`
 - `SEARCH_SNIPPET_LIMIT`
 - `FETCH_CONTENT_LIMIT`
 
@@ -228,8 +227,7 @@ docs/
   ARCHITECTURE.md
   GITHUB_PUBLISHING.md
   SETUP.md
-article/
-  x-thread.md
+test_bot.py
 requirements.txt
 .env.example
 ```
