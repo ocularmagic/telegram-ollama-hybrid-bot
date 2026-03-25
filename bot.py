@@ -5,6 +5,7 @@ import html
 import time
 import logging
 import asyncio
+import threading
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -43,11 +44,15 @@ EVIDENCE_TIMEOUT_SECONDS = int(os.getenv("EVIDENCE_TIMEOUT_SECONDS", "300"))
 LOCAL_MODEL_TIMEOUT_SECONDS = int(os.getenv("LOCAL_MODEL_TIMEOUT_SECONDS", "300"))
 FINAL_TIMEOUT_SECONDS = int(os.getenv("FINAL_TIMEOUT_SECONDS", "600"))
 
-SEARCH_QUERY_LIMIT = int(os.getenv("SEARCH_QUERY_LIMIT", "6"))
-SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "8"))
+SEARCH_QUERY_LIMIT = int(os.getenv("SEARCH_QUERY_LIMIT", "3"))
+SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "5"))
 TOTAL_CANDIDATE_LIMIT = int(os.getenv("TOTAL_CANDIDATE_LIMIT", "40"))
 SEARCH_SNIPPET_LIMIT = int(os.getenv("SEARCH_SNIPPET_LIMIT", "280"))
 FETCH_CONTENT_LIMIT = int(os.getenv("FETCH_CONTENT_LIMIT", "900"))
+SEARCH_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "43200"))
+SEARCH_CACHE_PATH = os.getenv("SEARCH_CACHE_PATH", "search_cache.json")
+SEARCH_STATS_PATH = os.getenv("SEARCH_STATS_PATH", "search_stats.json")
+GOOGLE_DAILY_QUERY_LIMIT = int(os.getenv("GOOGLE_DAILY_QUERY_LIMIT", "500"))
 
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "3"))
 MEMORY_QUESTION_CHARS = int(os.getenv("MEMORY_QUESTION_CHARS", "1200"))
@@ -55,6 +60,10 @@ MEMORY_ANSWER_CHARS = int(os.getenv("MEMORY_ANSWER_CHARS", "5000"))
 
 CHAT_MEMORY = {}
 CHAT_LOCKS = {}
+SEARCH_CACHE = {}
+SEARCH_CACHE_LOCK = threading.Lock()
+SEARCH_STATS = {}
+SEARCH_STATS_LOCK = threading.Lock()
 PROGRESS_STAGES = [
     ("starting", "Starting request"),
     ("planning", "Planning search"),
@@ -139,6 +148,10 @@ class GeminiQuotaExceededError(RuntimeError):
     pass
 
 
+class GeminiSearchUnavailableError(RuntimeError):
+    pass
+
+
 def truncate_text(text: str, max_len: int) -> str:
     text = text or ""
     return text if len(text) <= max_len else text[:max_len]
@@ -146,6 +159,222 @@ def truncate_text(text: str, max_len: int) -> str:
 
 def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def normalize_query_for_cache(query: str) -> str:
+    return normalize_whitespace((query or "").lower())
+
+
+def load_search_cache() -> None:
+    global SEARCH_CACHE
+
+    try:
+        if not os.path.exists(SEARCH_CACHE_PATH):
+            SEARCH_CACHE = {}
+            return
+
+        with open(SEARCH_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        SEARCH_CACHE = data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("Failed to load search cache from %s: %s", SEARCH_CACHE_PATH, e)
+        SEARCH_CACHE = {}
+
+
+def persist_search_cache() -> None:
+    try:
+        directory = os.path.dirname(SEARCH_CACHE_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        temp_path = f"{SEARCH_CACHE_PATH}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(SEARCH_CACHE, f, ensure_ascii=True, separators=(",", ":"))
+        os.replace(temp_path, SEARCH_CACHE_PATH)
+    except Exception as e:
+        logger.warning("Failed to persist search cache to %s: %s", SEARCH_CACHE_PATH, e)
+
+
+def prune_expired_search_cache(now: int | None = None) -> None:
+    now = int(now or time.time())
+    expired_keys = []
+
+    for key, entry in SEARCH_CACHE.items():
+        expires_at = entry.get("expires_at", 0)
+        if not isinstance(expires_at, int) or expires_at <= now:
+            expired_keys.append(key)
+
+    for key in expired_keys:
+        SEARCH_CACHE.pop(key, None)
+
+
+def get_search_cache_entry(cache_key: str) -> dict | None:
+    with SEARCH_CACHE_LOCK:
+        prune_expired_search_cache()
+        entry = SEARCH_CACHE.get(cache_key)
+        if not entry:
+            return None
+
+        value = entry.get("value")
+        if not isinstance(value, dict):
+            SEARCH_CACHE.pop(cache_key, None)
+            persist_search_cache()
+            return None
+
+        return value
+
+
+def set_search_cache_entry(cache_key: str, value: dict) -> None:
+    with SEARCH_CACHE_LOCK:
+        prune_expired_search_cache()
+        SEARCH_CACHE[cache_key] = {
+            "expires_at": int(time.time()) + SEARCH_CACHE_TTL_SECONDS,
+            "value": value,
+        }
+        persist_search_cache()
+
+
+def build_grounded_search_cache_key(question: str, recent_chat_context: str, plan: dict) -> str:
+    payload = {
+        "kind": "grounded_search",
+        "model": SEARCH_RETRIEVAL_MODEL,
+        "question": normalize_query_for_cache(question),
+        "recent_chat_context": normalize_query_for_cache(recent_chat_context),
+        "queries": [
+            normalize_query_for_cache(item.get("query", ""))
+            for item in (plan.get("queries", []) or [])[:SEARCH_QUERY_LIMIT]
+            if normalize_query_for_cache(item.get("query", ""))
+        ],
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def build_web_search_cache_key(query: str, max_results: int) -> str:
+    payload = {
+        "kind": "web_search",
+        "query": normalize_query_for_cache(query),
+        "max_results": int(max_results),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def load_search_stats() -> None:
+    global SEARCH_STATS
+
+    try:
+        if not os.path.exists(SEARCH_STATS_PATH):
+            SEARCH_STATS = {}
+            return
+
+        with open(SEARCH_STATS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        SEARCH_STATS = data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("Failed to load search stats from %s: %s", SEARCH_STATS_PATH, e)
+        SEARCH_STATS = {}
+
+
+def persist_search_stats() -> None:
+    try:
+        directory = os.path.dirname(SEARCH_STATS_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        temp_path = f"{SEARCH_STATS_PATH}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(SEARCH_STATS, f, ensure_ascii=True, separators=(",", ":"))
+        os.replace(temp_path, SEARCH_STATS_PATH)
+    except Exception as e:
+        logger.warning("Failed to persist search stats to %s: %s", SEARCH_STATS_PATH, e)
+
+
+def today_key() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def default_daily_search_stats() -> dict:
+    return {
+        "ask_count": 0,
+        "google_uncached_asks": 0,
+        "google_executed_queries": 0,
+        "cache_hit_asks": 0,
+        "fallback_asks": 0,
+    }
+
+
+def record_search_metrics(metrics: dict) -> None:
+    if not metrics:
+        return
+
+    with SEARCH_STATS_LOCK:
+        day = today_key()
+        entry = SEARCH_STATS.get(day)
+        if not isinstance(entry, dict):
+            entry = default_daily_search_stats()
+            SEARCH_STATS[day] = entry
+
+        entry["ask_count"] = int(entry.get("ask_count", 0)) + 1
+
+        retrieval_mode = metrics.get("retrieval_mode", "")
+        cache_hit = bool(metrics.get("cache_hit"))
+
+        if cache_hit:
+            entry["cache_hit_asks"] = int(entry.get("cache_hit_asks", 0)) + 1
+
+        if retrieval_mode == "Ollama web search fallback":
+            entry["fallback_asks"] = int(entry.get("fallback_asks", 0)) + 1
+
+        if retrieval_mode == "Gemini grounded search" and not cache_hit:
+            entry["google_uncached_asks"] = int(entry.get("google_uncached_asks", 0)) + 1
+            entry["google_executed_queries"] = int(entry.get("google_executed_queries", 0)) + int(
+                metrics.get("executed_query_count", 0)
+            )
+
+        persist_search_stats()
+
+
+def get_today_search_stats() -> dict:
+    with SEARCH_STATS_LOCK:
+        day = today_key()
+        entry = SEARCH_STATS.get(day)
+        if not isinstance(entry, dict):
+            entry = default_daily_search_stats()
+            SEARCH_STATS[day] = entry
+        return dict(entry)
+
+
+def format_today_search_stats() -> str:
+    stats = get_today_search_stats()
+    ask_count = int(stats.get("ask_count", 0))
+    google_uncached_asks = int(stats.get("google_uncached_asks", 0))
+    google_executed_queries = int(stats.get("google_executed_queries", 0))
+    cache_hit_asks = int(stats.get("cache_hit_asks", 0))
+    fallback_asks = int(stats.get("fallback_asks", 0))
+    remaining_google_queries = max(0, GOOGLE_DAILY_QUERY_LIMIT - google_executed_queries)
+
+    if google_uncached_asks > 0:
+        avg_queries_per_uncached_ask = google_executed_queries / google_uncached_asks
+        estimated_remaining_uncached_asks = int(remaining_google_queries / avg_queries_per_uncached_ask) if avg_queries_per_uncached_ask > 0 else 0
+        avg_text = f"{avg_queries_per_uncached_ask:.2f}"
+    else:
+        avg_queries_per_uncached_ask = 0.0
+        estimated_remaining_uncached_asks = GOOGLE_DAILY_QUERY_LIMIT
+        avg_text = "0.00"
+
+    cache_hit_rate = (cache_hit_asks / ask_count * 100.0) if ask_count > 0 else 0.0
+
+    return (
+        f"Daily search stats ({today_key()})\n"
+        f"Total asks today: {ask_count}\n"
+        f"Google uncached asks today: {google_uncached_asks}\n"
+        f"Google executed queries today: {google_executed_queries}/{GOOGLE_DAILY_QUERY_LIMIT}\n"
+        f"Cache-hit asks today: {cache_hit_asks} ({cache_hit_rate:.1f}%)\n"
+        f"Ollama fallback asks today: {fallback_asks}\n"
+        f"Avg Google queries per uncached ask: {avg_text}\n"
+        f"Estimated uncached asks remaining before limit: {estimated_remaining_uncached_asks}"
+    )
 
 
 def domain_from_url(url: str) -> str:
@@ -212,6 +441,12 @@ def is_gemini_quota_error(error: Exception) -> bool:
     return "RESOURCE_EXHAUSTED" in text or ("429" in text and "quota" in text.lower())
 
 
+def is_gemini_search_503_error(error: Exception) -> bool:
+    text = str(error or "")
+    upper_text = text.upper()
+    return "503" in text or "HTTP 503" in upper_text or "UNAVAILABLE" in upper_text
+
+
 def ollama_api_post(path: str, payload: dict) -> dict:
     api_key = os.getenv("OLLAMA_API_KEY")
     if not api_key:
@@ -243,13 +478,29 @@ def ollama_api_post(path: str, payload: dict) -> dict:
 
 def ollama_web_search(query: str, max_results: int = SEARCH_RESULTS_PER_QUERY) -> dict:
     max_results = max(1, min(max_results, 10))
-    return ollama_api_post(
+    cache_key = build_web_search_cache_key(query, max_results)
+    cached_response = get_search_cache_entry(cache_key)
+    if cached_response:
+        return {
+            "results": cached_response.get("results", []),
+            "cache_hit": True,
+        }
+
+    response = ollama_api_post(
         "web_search",
         {
             "query": query,
             "max_results": max_results,
         },
     )
+    set_search_cache_entry(
+        cache_key,
+        {
+            "results": response.get("results", []) or [],
+        },
+    )
+    response["cache_hit"] = False
+    return response
 
 
 def get_chat_history(chat_id: int):
@@ -413,6 +664,8 @@ SEARCH PLAN:
     except Exception as e:
         if is_gemini_quota_error(e):
             raise GeminiQuotaExceededError(str(e)) from e
+        if is_gemini_search_503_error(e):
+            raise GeminiSearchUnavailableError(str(e)) from e
         raise
 
     candidates = getattr(response, "candidates", None) or []
@@ -525,7 +778,7 @@ def choose_fetch_candidates(query_buckets: list, fetch_limit: int) -> list:
     return chosen
 
 
-def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict) -> str:
+def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict) -> dict:
     queries = plan.get("queries", [])[:SEARCH_QUERY_LIMIT]
 
     all_candidates = []
@@ -534,28 +787,73 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
     grounded_summaries = []
     notices = []
     retrieval_label = "Gemini grounded search"
+    cache_hit = False
 
-    try:
-        search_response = gemini_grounded_search(question, recent_chat_context, plan)
-    except GeminiQuotaExceededError as e:
-        logger.warning("Gemini grounded search quota exhausted: %s", e)
+    def fallback_to_ollama(gemini_error: Exception, notice_message: str, fallback_unavailable_notice: str, fallback_error_prefix: str):
+        nonlocal retrieval_label
         retrieval_label = "Ollama web search fallback"
         try:
-            search_response = ollama_search_pool(question, plan)
-            search_errors.extend(search_response.get("errors", []))
-            notices.append("Gemini search quota exhausted. Fell back to Ollama web search.")
+            fallback_response = ollama_search_pool(question, plan)
+            search_errors.extend(fallback_response.get("errors", []))
+            notices.append(notice_message)
+            return fallback_response
         except Exception as fallback_error:
-            logger.warning("Ollama fallback search failed: %s", fallback_error)
-            notices.append(
-                "Gemini search quota exhausted, and Ollama web-search fallback was unavailable. "
-                "Add OLLAMA_API_KEY or wait for Gemini quota reset."
-            )
+            logger.warning("Ollama fallback search failed after Gemini error: %s", fallback_error)
+            notices.append(fallback_unavailable_notice)
+            search_errors.append(f"{fallback_error_prefix}: {gemini_error}")
             search_errors.append(f"Fallback search failed: {fallback_error}")
-            search_response = {"summary": "", "results": [], "executed_queries": []}
-    except Exception as e:
-        logger.warning("Grounded search failed for question %r: %s", question, e)
-        search_errors.append(f"Grounded search failed: {e}")
-        search_response = {"summary": "", "results": [], "executed_queries": []}
+            return {"summary": "", "results": [], "executed_queries": []}
+
+    grounded_cache_key = build_grounded_search_cache_key(question, recent_chat_context, plan)
+    cached_grounded_response = get_search_cache_entry(grounded_cache_key)
+    if cached_grounded_response:
+        search_response = cached_grounded_response
+        retrieval_label = "Gemini grounded search (cached)"
+        cache_hit = True
+    else:
+        try:
+            search_response = gemini_grounded_search(question, recent_chat_context, plan)
+            set_search_cache_entry(
+                grounded_cache_key,
+                {
+                    "summary": search_response.get("summary", ""),
+                    "results": search_response.get("results", []) or [],
+                    "executed_queries": search_response.get("executed_queries", []) or [],
+                },
+            )
+        except GeminiQuotaExceededError as e:
+            logger.warning("Gemini grounded search quota exhausted: %s", e)
+            search_response = fallback_to_ollama(
+                gemini_error=e,
+                notice_message="Gemini search quota exhausted. Fell back to Ollama web search.",
+                fallback_unavailable_notice=(
+                    "Gemini search quota exhausted, and Ollama web-search fallback was unavailable. "
+                    "Add OLLAMA_API_KEY or wait for Gemini quota reset."
+                ),
+                fallback_error_prefix="Gemini search quota exhausted",
+            )
+        except GeminiSearchUnavailableError as e:
+            logger.warning("Gemini grounded search returned 503/unavailable: %s", e)
+            search_response = fallback_to_ollama(
+                gemini_error=e,
+                notice_message="Gemini grounded search returned 503. Fell back to Ollama web search.",
+                fallback_unavailable_notice=(
+                    "Gemini grounded search returned 503, and Ollama web-search fallback was unavailable. "
+                    "Check Gemini availability and OLLAMA_API_KEY."
+                ),
+                fallback_error_prefix="Gemini grounded search returned 503",
+            )
+        except Exception as e:
+            logger.warning("Grounded search failed for question %r: %s", question, e)
+            search_response = fallback_to_ollama(
+                gemini_error=e,
+                notice_message="Gemini grounded search failed. Fell back to Ollama web search.",
+                fallback_unavailable_notice=(
+                    "Gemini grounded search failed, and Ollama web-search fallback was unavailable. "
+                    "Check Gemini availability and OLLAMA_API_KEY."
+                ),
+                fallback_error_prefix="Grounded search failed",
+            )
 
     if search_response.get("summary"):
         grounded_summaries.append(
@@ -641,10 +939,64 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
         lines.append("- No grounded summaries collected.")
         lines.append("")
 
+    executed_queries = []
+    for item in grounded_summaries:
+        executed_queries.extend(item.get("executed_queries", []))
+
+    unique_executed_queries = []
+    seen_executed_queries = set()
+    for query in executed_queries:
+        normalized_query = normalize_query_for_cache(query)
+        if not normalized_query or normalized_query in seen_executed_queries:
+            continue
+        seen_executed_queries.add(normalized_query)
+        unique_executed_queries.append(normalize_whitespace(query))
+
+    metrics = {
+        "retrieval_mode": retrieval_label,
+        "cache_hit": cache_hit,
+        "planned_query_count": len(queries),
+        "planned_queries": [
+            normalize_whitespace(item.get("query", ""))
+            for item in queries
+            if normalize_whitespace(item.get("query", ""))
+        ],
+        "executed_query_count": len(executed_queries),
+        "unique_executed_query_count": len(unique_executed_queries),
+        "executed_queries": unique_executed_queries,
+        "candidate_count": len(all_candidates),
+    }
+
     return {
         "pool_text": "\n".join(lines).strip(),
         "notices": notices,
+        "metrics": metrics,
     }
+
+
+def format_search_metrics_notice(metrics: dict) -> str:
+    if not metrics:
+        return "Search cost: unavailable."
+
+    executed_queries = metrics.get("executed_queries", []) or []
+    lines = [
+        "Search cost",
+        f"Retrieval mode: {metrics.get('retrieval_mode', 'unknown')}",
+        f"Cache hit: {'yes' if metrics.get('cache_hit') else 'no'}",
+        f"Planned queries: {metrics.get('planned_query_count', 0)}",
+        (
+            f"Executed queries: {metrics.get('executed_query_count', 0)} total "
+            f"({metrics.get('unique_executed_query_count', 0)} unique)"
+        ),
+        f"Candidate results kept: {metrics.get('candidate_count', 0)}",
+    ]
+
+    if executed_queries:
+        lines.append("Executed search queries:")
+        for idx, query in enumerate(executed_queries, start=1):
+            lines.append(f"{idx}. {query}")
+
+    return "\n".join(lines)
 
 
 def call_ollama_model(model_name: str, user_text: str, system_prompt: str) -> str:
@@ -1028,6 +1380,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         )
         shared_pool = search_result.get("pool_text", "")
         notices = list(search_result.get("notices", []))
+        search_metrics = search_result.get("metrics", {})
 
         if pool_error:
             shared_pool = (
@@ -1045,6 +1398,32 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
                 "- None"
             )
             notices = []
+            search_metrics = {
+                "retrieval_mode": "Search pool unavailable",
+                "cache_hit": False,
+                "planned_query_count": len(plan.get("queries", [])),
+                "planned_queries": [
+                    normalize_whitespace(item.get("query", ""))
+                    for item in plan.get("queries", [])
+                    if normalize_whitespace(item.get("query", ""))
+                ],
+                "executed_query_count": 0,
+                "unique_executed_query_count": 0,
+                "executed_queries": [],
+                "candidate_count": 0,
+            }
+
+        notices.append(format_search_metrics_notice(search_metrics))
+        record_search_metrics(search_metrics)
+        logger.info(
+            "Search metrics | mode=%s planned=%s executed_total=%s executed_unique=%s candidates=%s queries=%s",
+            search_metrics.get("retrieval_mode", "unknown"),
+            search_metrics.get("planned_query_count", 0),
+            search_metrics.get("executed_query_count", 0),
+            search_metrics.get("unique_executed_query_count", 0),
+            search_metrics.get("candidate_count", 0),
+            search_metrics.get("executed_queries", []),
+        )
 
         local_prompt = build_local_prompt(question, recent_chat_context, shared_pool)
 
@@ -1136,7 +1515,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Heartbeat interval: {HEARTBEAT_SECONDS}s\n"
         f"Evidence timeout: {EVIDENCE_TIMEOUT_SECONDS}s\n"
         f"Local model timeout: {LOCAL_MODEL_TIMEOUT_SECONDS}s\n"
-        f"Final timeout: {FINAL_TIMEOUT_SECONDS}s"
+        f"Final timeout: {FINAL_TIMEOUT_SECONDS}s\n\n"
+        f"{format_today_search_stats()}"
     )
 
 
@@ -1188,6 +1568,9 @@ def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+
+    load_search_cache()
+    load_search_stats()
 
     app = ApplicationBuilder().token(token).build()
 
