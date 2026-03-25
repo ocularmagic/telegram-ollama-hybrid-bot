@@ -377,12 +377,22 @@ def gemini_grounded_search(question: str, recent_chat_context: str, plan: dict) 
         query_lines.append(f"Purpose: {normalize_whitespace(item.get('purpose', '')) or 'general angle'}")
         query_lines.append("")
 
-    prompt = f"""Use Google Search grounding to gather web evidence for one search angle.
+    prompt = f"""Use Google Search grounding to gather a broad evidence pool for the user's question.
 
-Do not answer the user fully yet.
-Use the search plan below as guidance for what to look for.
-Focus on collecting useful facts and relevant web sources for the overall question.
-Keep the response concise and factual.
+    Do not answer the user fully yet.
+    Use the search plan below as guidance and try to cover its distinct angles in one grounded pass.
+    Focus on collecting useful facts and relevant web sources for the overall question.
+    Prefer breadth and diversity of sources over repeating one angle.
+
+    Retrieval goals:
+    - cover the direct query
+    - include official or primary sources when relevant
+    - include current or recent sources when freshness matters
+    - include comparison, overview, or buyer-guide style sources when the user is choosing between options
+    - surface distinct relevant sources rather than near-duplicates
+
+    Keep the response concise, factual, and optimized as a retrieval summary rather than a final polished answer.
+    Mention notable tradeoffs, uncertainty, and strong source categories that appeared in search.
 
 RECENT CHAT CONTEXT:
 {recent_chat_context}
@@ -436,7 +446,7 @@ SEARCH PLAN:
 
     return {
         "summary": truncate_text(normalize_whitespace(response.text or ""), FETCH_CONTENT_LIMIT),
-        "results": results[:SEARCH_RESULTS_PER_QUERY],
+        "results": results[:TOTAL_CANDIDATE_LIMIT],
         "executed_queries": [normalize_whitespace(item) for item in web_search_queries if normalize_whitespace(item)],
     }
 
