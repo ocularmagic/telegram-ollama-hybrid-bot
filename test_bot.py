@@ -32,22 +32,67 @@ class BotHelpersTest(unittest.TestCase):
             ],
         }
 
-        def fake_search(question, recent_chat_context, query_text, purpose):
-            if query_text == "bad query":
+        def fake_search(question, recent_chat_context, search_plan):
+            self.assertEqual(search_plan, plan)
+            if question == "question":
                 raise RuntimeError("boom")
-            return {
-                "summary": "Example snippet",
-                "results": [{"title": "Good Result", "url": "https://example.com/good"}],
-                "executed_queries": ["good query"],
-            }
 
         with patch("bot.gemini_grounded_search", side_effect=fake_search):
-            shared_pool = bot.build_shared_search_pool("question", "None", plan)
+            search_result = bot.build_shared_search_pool("question", "None", plan)
+            shared_pool = search_result["pool_text"]
+
+        self.assertIn("SEARCH WARNINGS", shared_pool)
+        self.assertIn("Grounded search failed: boom", shared_pool)
+        self.assertIn("No search results collected.", shared_pool)
+        self.assertIn("GROUNDED QUERY SUMMARIES", shared_pool)
+
+    def test_build_shared_search_pool_collects_results_from_single_grounded_call(self):
+        plan = {
+            "search_objective": "Test objective",
+            "queries": [
+                {"query": "query one", "purpose": "first angle"},
+                {"query": "query two", "purpose": "second angle"},
+            ],
+        }
+
+        with patch(
+            "bot.gemini_grounded_search",
+            return_value={
+                "summary": "Combined grounded summary",
+                "results": [{"title": "Good Result", "url": "https://example.com/good"}],
+                "executed_queries": ["query one", "query two"],
+            },
+        ):
+            search_result = bot.build_shared_search_pool("question", "None", plan)
+            shared_pool = search_result["pool_text"]
 
         self.assertIn("Good Result", shared_pool)
-        self.assertIn("SEARCH WARNINGS", shared_pool)
-        self.assertIn("Q2 failed: boom", shared_pool)
-        self.assertIn("GROUNDED QUERY SUMMARIES", shared_pool)
+        self.assertIn("Combined grounded summary", shared_pool)
+        self.assertIn("Google queries: query one, query two", shared_pool)
+
+    def test_build_shared_search_pool_falls_back_to_ollama_when_gemini_quota_exhausted(self):
+        plan = {
+            "search_objective": "Test objective",
+            "queries": [{"query": "query one", "purpose": "first angle"}],
+        }
+
+        with patch(
+            "bot.gemini_grounded_search",
+            side_effect=bot.GeminiQuotaExceededError("429 RESOURCE_EXHAUSTED"),
+        ), patch(
+            "bot.ollama_search_pool",
+            return_value={
+                "summary": "Fallback retrieval from Ollama web search.",
+                "results": [{"title": "Fallback Result", "url": "https://example.com/fallback"}],
+                "executed_queries": ["query one"],
+                "errors": [],
+            },
+        ):
+            search_result = bot.build_shared_search_pool("question", "None", plan)
+
+        self.assertIn("Gemini search quota exhausted. Fell back to Ollama web search.", search_result["notices"])
+        self.assertIn("Ollama web search fallback", search_result["pool_text"])
+        self.assertIn("Fallback Result", search_result["pool_text"])
 
     def test_save_chat_turn_trims_history(self):
         for index in range(bot.MAX_HISTORY_TURNS + 2):

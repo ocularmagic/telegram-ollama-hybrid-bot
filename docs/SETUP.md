@@ -38,6 +38,10 @@ You need:
 - `BOT_USERNAME`
 - `GEMINI_API_KEY`
 
+Optional:
+
+- `OLLAMA_API_KEY` if you want Ollama web-search fallback when Gemini quota is exhausted
+
 ## 5. Install Python dependencies
 
 ```bash
@@ -54,6 +58,7 @@ Example variables:
 TELEGRAM_BOT_TOKEN=...
 BOT_USERNAME=...
 GEMINI_API_KEY=...
+OLLAMA_API_KEY=...
 ```
 
 The bot loads `.env` automatically.

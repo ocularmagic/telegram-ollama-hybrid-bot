@@ -112,6 +112,10 @@ Minimum required variables:
 
 The bot now loads `.env` automatically at startup.
 
+Optional variable:
+
+- `OLLAMA_API_KEY` if you want Ollama web-search fallback when Gemini quota is exhausted
+
 ### 5. Pull the default local models once
 
 ```bash
