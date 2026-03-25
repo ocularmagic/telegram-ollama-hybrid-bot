@@ -8,5 +8,7 @@ venv/
 .vscode/
 logs/
 *.log
+search_cache.json
+search_stats.json
 start_bot.bat
 update_and_start_bot.bat

@@ -198,6 +198,13 @@ Useful knobs in `bot.py`:
 - `TOTAL_CANDIDATE_LIMIT`
 - `SEARCH_SNIPPET_LIMIT`
 - `FETCH_CONTENT_LIMIT`
+- `SEARCH_CACHE_TTL_SECONDS`
+- `SEARCH_CACHE_PATH`
+- `SEARCH_STATS_PATH`
+- `GOOGLE_DAILY_QUERY_LIMIT`
+
+The bot also keeps a persistent search cache on disk. Repeated normalized searches can reuse the same retrieval result for 12 hours by default instead of spending another grounded-search or web-search call.
+It also keeps daily search stats on disk so `/status` can show how many uncached Google grounded queries were used today and estimate how many uncached asks remain before the configured daily limit.
 
 ### Timeouts are intentionally generous
 
