@@ -6,6 +6,8 @@ import time
 import logging
 import asyncio
 import urllib.parse
+import urllib.request
+import urllib.error
 
 from telegram import Update
 from telegram.error import BadRequest
@@ -18,10 +20,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=os.getenv("LOG_LEVEL", "WARNING").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "qwen3:14b")
 LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "gemma3:12b")
@@ -50,6 +55,15 @@ MEMORY_ANSWER_CHARS = int(os.getenv("MEMORY_ANSWER_CHARS", "5000"))
 
 CHAT_MEMORY = {}
 CHAT_LOCKS = {}
+PROGRESS_STAGES = [
+    ("starting", "Starting request"),
+    ("planning", "Planning search"),
+    ("search_pool", "Gathering evidence"),
+    ("local_model_1", f"Running {LOCAL_MODEL_1}"),
+    ("local_model_2", f"Running {LOCAL_MODEL_2}"),
+    ("final", f"Running {CLOUD_MODEL}"),
+    ("sending", "Sending answer"),
+]
 
 LOCAL_SYSTEM_PROMPT = """You are a helpful technical assistant.
 
@@ -121,6 +135,10 @@ ASK_USAGE = (
 )
 
 
+class GeminiQuotaExceededError(RuntimeError):
+    pass
+
+
 def truncate_text(text: str, max_len: int) -> str:
     text = text or ""
     return text if len(text) <= max_len else text[:max_len]
@@ -187,6 +205,51 @@ def get_gemini_client():
 
 def get_grounding_tool():
     return types.Tool(google_search=types.GoogleSearch())
+
+
+def is_gemini_quota_error(error: Exception) -> bool:
+    text = str(error or "")
+    return "RESOURCE_EXHAUSTED" in text or ("429" in text and "quota" in text.lower())
+
+
+def ollama_api_post(path: str, payload: dict) -> dict:
+    api_key = os.getenv("OLLAMA_API_KEY")
+    if not api_key:
+        raise RuntimeError("OLLAMA_API_KEY is not set.")
+
+    url = f"https://ollama.com/api/{path}"
+    data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Ollama API HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Ollama API connection error: {e}")
+
+
+def ollama_web_search(query: str, max_results: int = SEARCH_RESULTS_PER_QUERY) -> dict:
+    max_results = max(1, min(max_results, 10))
+    return ollama_api_post(
+        "web_search",
+        {
+            "query": query,
+            "max_results": max_results,
+        },
+    )
 
 
 def get_chat_history(chat_id: int):
@@ -306,12 +369,19 @@ CURRENT USER QUESTION:
     }
 
 
-def gemini_grounded_search(question: str, recent_chat_context: str, query_text: str, purpose: str) -> dict:
+def gemini_grounded_search(question: str, recent_chat_context: str, plan: dict) -> dict:
     client = get_gemini_client()
+    query_lines = []
+    for idx, item in enumerate(plan.get("queries", [])[:SEARCH_QUERY_LIMIT], start=1):
+        query_lines.append(f"Q{idx}: {normalize_whitespace(item.get('query', ''))}")
+        query_lines.append(f"Purpose: {normalize_whitespace(item.get('purpose', '')) or 'general angle'}")
+        query_lines.append("")
+
     prompt = f"""Use Google Search grounding to gather web evidence for one search angle.
 
 Do not answer the user fully yet.
-Focus on collecting useful facts and relevant web sources for this search angle.
+Use the search plan below as guidance for what to look for.
+Focus on collecting useful facts and relevant web sources for the overall question.
 Keep the response concise and factual.
 
 RECENT CHAT CONTEXT:
@@ -320,18 +390,20 @@ RECENT CHAT CONTEXT:
 CURRENT USER QUESTION:
 {question}
 
-SEARCH ANGLE:
-{query_text}
-
-PURPOSE:
-{purpose}
+SEARCH PLAN:
+{chr(10).join(query_lines).strip() or "No explicit search plan provided."}
 """
 
-    response = client.models.generate_content(
-        model=SEARCH_RETRIEVAL_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(tools=[get_grounding_tool()]),
-    )
+    try:
+        response = client.models.generate_content(
+            model=SEARCH_RETRIEVAL_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(tools=[get_grounding_tool()]),
+        )
+    except Exception as e:
+        if is_gemini_quota_error(e):
+            raise GeminiQuotaExceededError(str(e)) from e
+        raise
 
     candidates = getattr(response, "candidates", None) or []
     grounding_metadata = None
@@ -369,6 +441,53 @@ PURPOSE:
     }
 
 
+def ollama_search_pool(question: str, plan: dict) -> dict:
+    all_candidates = []
+    deduped_by_url = {}
+    search_errors = []
+    executed_queries = []
+
+    for idx, query_item in enumerate(plan.get("queries", [])[:SEARCH_QUERY_LIMIT], start=1):
+        query_text = normalize_whitespace(query_item.get("query", ""))
+        if not query_text:
+            continue
+
+        executed_queries.append(query_text)
+        try:
+            response = ollama_web_search(query_text, SEARCH_RESULTS_PER_QUERY)
+        except Exception as e:
+            logger.warning("Ollama fallback search failed for %r: %s", query_text, e)
+            search_errors.append(f"Q{idx} failed: {e}")
+            continue
+
+        for rank, result in enumerate(response.get("results", []) or [], start=1):
+            title = normalize_whitespace(result.get("title", ""))
+            url = normalize_whitespace(result.get("url", ""))
+            snippet = truncate_text(normalize_whitespace(result.get("content", "")), SEARCH_SNIPPET_LIMIT)
+
+            if not url:
+                continue
+
+            candidate = {
+                "rank_within_query": rank,
+                "title": title or "Untitled result",
+                "url": url,
+                "source": domain_from_url(url),
+                "snippet": snippet,
+            }
+
+            if url not in deduped_by_url and len(all_candidates) < TOTAL_CANDIDATE_LIMIT:
+                deduped_by_url[url] = candidate
+                all_candidates.append(candidate)
+
+    return {
+        "summary": "Fallback retrieval from Ollama web search.",
+        "results": all_candidates,
+        "executed_queries": executed_queries,
+        "errors": search_errors,
+    }
+
+
 def choose_fetch_candidates(query_buckets: list, fetch_limit: int) -> list:
     chosen = []
     seen_urls = set()
@@ -403,62 +522,72 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
     deduped_by_url = {}
     search_errors = []
     grounded_summaries = []
+    notices = []
+    retrieval_label = "Gemini grounded search"
 
-    for idx, query_item in enumerate(queries, start=1):
-        query_text = normalize_whitespace(query_item.get("query", ""))
-        purpose = normalize_whitespace(query_item.get("purpose", "")) or "general angle"
-
-        if not query_text:
-            continue
-
+    try:
+        search_response = gemini_grounded_search(question, recent_chat_context, plan)
+    except GeminiQuotaExceededError as e:
+        logger.warning("Gemini grounded search quota exhausted: %s", e)
+        retrieval_label = "Ollama web search fallback"
         try:
-            search_response = gemini_grounded_search(question, recent_chat_context, query_text, purpose)
-        except Exception as e:
-            error_text = f"Q{idx} failed: {e}"
-            logger.warning("Search query failed for %r: %s", query_text, e)
-            search_errors.append(error_text)
+            search_response = ollama_search_pool(question, plan)
+            search_errors.extend(search_response.get("errors", []))
+            notices.append("Gemini search quota exhausted. Fell back to Ollama web search.")
+        except Exception as fallback_error:
+            logger.warning("Ollama fallback search failed: %s", fallback_error)
+            notices.append(
+                "Gemini search quota exhausted, and Ollama web-search fallback was unavailable. "
+                "Add OLLAMA_API_KEY or wait for Gemini quota reset."
+            )
+            search_errors.append(f"Fallback search failed: {fallback_error}")
+            search_response = {"summary": "", "results": [], "executed_queries": []}
+    except Exception as e:
+        logger.warning("Grounded search failed for question %r: %s", question, e)
+        search_errors.append(f"Grounded search failed: {e}")
+        search_response = {"summary": "", "results": [], "executed_queries": []}
+
+    if search_response.get("summary"):
+        grounded_summaries.append(
+            {
+                "summary": search_response["summary"],
+                "executed_queries": search_response.get("executed_queries", []),
+                "label": retrieval_label,
+            }
+        )
+
+    raw_results = search_response.get("results", []) or []
+    for rank, result in enumerate(raw_results, start=1):
+        title = normalize_whitespace(result.get("title", ""))
+        url = normalize_whitespace(result.get("url", ""))
+
+        if not url:
             continue
 
-        if search_response.get("summary"):
-            grounded_summaries.append(
-                {
-                    "query_index": idx,
-                    "query_text": query_text,
-                    "purpose": purpose,
-                    "summary": search_response["summary"],
-                    "executed_queries": search_response.get("executed_queries", []),
-                }
-            )
+        candidate = {
+            "query_index": 0,
+            "query_text": "Grounded search",
+            "purpose": "combined search plan",
+            "rank_within_query": rank,
+            "title": title or "Untitled result",
+            "url": url,
+            "source": domain_from_url(url),
+            "snippet": truncate_text(
+                search_response.get("summary", ""),
+                SEARCH_SNIPPET_LIMIT,
+            ),
+        }
 
-        raw_results = search_response.get("results", []) or []
-        for rank, result in enumerate(raw_results, start=1):
-            title = normalize_whitespace(result.get("title", ""))
-            url = normalize_whitespace(result.get("url", ""))
-
-            if not url:
-                continue
-
-            candidate = {
-                "query_index": idx,
-                "query_text": query_text,
-                "purpose": purpose,
-                "rank_within_query": rank,
-                "title": title or "Untitled result",
-                "url": url,
-                "source": domain_from_url(url),
-                "snippet": truncate_text(
-                    search_response.get("summary", ""),
-                    SEARCH_SNIPPET_LIMIT,
-                ),
-            }
-
-            if url not in deduped_by_url and len(all_candidates) < TOTAL_CANDIDATE_LIMIT:
-                deduped_by_url[url] = candidate
-                all_candidates.append(candidate)
+        if url not in deduped_by_url and len(all_candidates) < TOTAL_CANDIDATE_LIMIT:
+            deduped_by_url[url] = candidate
+            all_candidates.append(candidate)
 
     lines = []
     lines.append("SEARCH OBJECTIVE")
     lines.append(f"- {plan.get('search_objective', 'Build a broad search pool.')}")
+    lines.append("")
+    lines.append("RETRIEVAL MODE")
+    lines.append(f"- {retrieval_label}")
     lines.append("")
     lines.append("RECENT CHAT CONTEXT")
     lines.append(recent_chat_context or "None")
@@ -480,7 +609,7 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
     if all_candidates:
         for idx, item in enumerate(all_candidates, start=1):
             lines.append(
-                f"[{idx:02d}] Query=Q{item['query_index']} | Source={item['source']} | Title={item['title']}"
+                f"[{idx:02d}] Source={item['source']} | Title={item['title']}"
             )
             lines.append(f"URL: {item['url']}")
             if item["snippet"]:
@@ -493,7 +622,7 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
     lines.append("GROUNDED QUERY SUMMARIES")
     if grounded_summaries:
         for idx, item in enumerate(grounded_summaries, start=1):
-            lines.append(f"[{idx:02d}] Query=Q{item['query_index']} | Purpose={item['purpose']}")
+            lines.append(f"[{idx:02d}] {item['label']}")
             if item["executed_queries"]:
                 lines.append(f"Google queries: {', '.join(item['executed_queries'])}")
             lines.append(f"Summary: {item['summary']}")
@@ -502,7 +631,10 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
         lines.append("- No grounded summaries collected.")
         lines.append("")
 
-    return "\n".join(lines).strip()
+    return {
+        "pool_text": "\n".join(lines).strip(),
+        "notices": notices,
+    }
 
 
 def call_ollama_model(model_name: str, user_text: str, system_prompt: str) -> str:
@@ -582,13 +714,31 @@ def build_fallback_answer(
     )
 
 
-def format_progress_text(stage: str, started_at: float) -> str:
-    elapsed = int(time.monotonic() - started_at)
-    return (
-        "Working on it...\n"
-        f"Stage: {stage}\n"
-        f"Elapsed: {elapsed}s"
-    )
+def format_progress_text(stage_state: dict) -> str:
+    elapsed = int(time.monotonic() - stage_state["started_at"])
+    current_stage = stage_state["stage"]
+    completed = stage_state.get("completed_stages", set())
+    detail = stage_state.get("detail", "")
+
+    lines = [
+        "Working on it...",
+        f"Elapsed: {elapsed}s",
+        "",
+    ]
+
+    for stage_key, label in PROGRESS_STAGES:
+        if stage_key in completed:
+            prefix = "[x]"
+        elif stage_key == current_stage:
+            prefix = "[>]"
+        else:
+            prefix = "[ ]"
+        lines.append(f"{prefix} {label}")
+
+    if detail:
+        lines.extend(["", f"Now: {detail}"])
+
+    return "\n".join(lines)
 
 
 def is_markdown_table_line(line: str) -> bool:
@@ -751,10 +901,13 @@ async def safe_edit_status_message(status_message, text: str) -> None:
 
 
 async def set_stage(status_message, stage_state: dict, stage_text: str) -> None:
+    previous_stage = stage_state.get("stage")
+    if previous_stage and previous_stage != stage_text:
+        stage_state.setdefault("completed_stages", set()).add(previous_stage)
     stage_state["stage"] = stage_text
     await safe_edit_status_message(
         status_message,
-        format_progress_text(stage_text, stage_state["started_at"]),
+        format_progress_text(stage_state),
     )
 
 
@@ -765,12 +918,13 @@ async def progress_heartbeat(status_message, stage_state: dict, stop_event: asyn
         except asyncio.TimeoutError:
             await safe_edit_status_message(
                 status_message,
-                format_progress_text(stage_state["stage"], stage_state["started_at"]),
+                format_progress_text(stage_state),
             )
 
 
 async def run_search_plan_step(status_message, stage_state: dict, question: str, recent_chat_context: str, timeout_seconds: int):
-    await set_stage(status_message, stage_state, "Planning broad search...")
+    stage_state["detail"] = "Building multiple search angles from your question."
+    await set_stage(status_message, stage_state, "planning")
 
     try:
         result = await asyncio.wait_for(
@@ -785,7 +939,8 @@ async def run_search_plan_step(status_message, stage_state: dict, question: str,
 
 
 async def run_search_pool_step(status_message, stage_state: dict, question: str, recent_chat_context: str, plan: dict, timeout_seconds: int):
-    await set_stage(status_message, stage_state, "Collecting shared search pool...")
+    stage_state["detail"] = "Running grounded web searches and collecting cited sources."
+    await set_stage(status_message, stage_state, "search_pool")
 
     try:
         result = await asyncio.wait_for(
@@ -794,21 +949,23 @@ async def run_search_pool_step(status_message, stage_state: dict, question: str,
         )
         return result, None
     except asyncio.TimeoutError:
-        return "", f"Shared search pool step timed out after {timeout_seconds} seconds."
+        return {"pool_text": "", "notices": []}, f"Shared search pool step timed out after {timeout_seconds} seconds."
     except Exception as e:
-        return "", f"Shared search pool step failed: {e}"
+        return {"pool_text": "", "notices": []}, f"Shared search pool step failed: {e}"
 
 
 async def run_ollama_step(
     status_message,
     stage_state: dict,
+    stage_key: str,
     stage_label: str,
     model_name: str,
     user_text: str,
     system_prompt: str,
     timeout_seconds: int,
 ):
-    await set_stage(status_message, stage_state, stage_label)
+    stage_state["detail"] = stage_label
+    await set_stage(status_message, stage_state, stage_key)
 
     try:
         result = await asyncio.wait_for(
@@ -827,10 +984,12 @@ async def run_ollama_step(
         return "", f"{stage_label} failed: {e}"
 
 
-async def orchestrate_answer(question: str, recent_chat_context: str, status_message) -> str:
+async def orchestrate_answer(question: str, recent_chat_context: str, status_message):
     stage_state = {
-        "stage": "Starting...",
+        "stage": "starting",
         "started_at": time.monotonic(),
+        "completed_stages": set(),
+        "detail": "Request received. Initializing pipeline.",
     }
     stop_event = asyncio.Event()
     heartbeat_task = asyncio.create_task(progress_heartbeat(status_message, stage_state, stop_event))
@@ -849,7 +1008,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
                 logger.warning("Falling back to default search plan: %s", plan_error)
             plan = default_search_plan(question)
 
-        shared_pool, pool_error = await run_search_pool_step(
+        search_result, pool_error = await run_search_pool_step(
             status_message=status_message,
             stage_state=stage_state,
             question=question,
@@ -857,6 +1016,8 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
             plan=plan,
             timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
         )
+        shared_pool = search_result.get("pool_text", "")
+        notices = list(search_result.get("notices", []))
 
         if pool_error:
             shared_pool = (
@@ -873,13 +1034,15 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
                 "GROUNDED QUERY SUMMARIES\n"
                 "- None"
             )
+            notices = []
 
         local_prompt = build_local_prompt(question, recent_chat_context, shared_pool)
 
         local_answer_1, local_error_1 = await run_ollama_step(
             status_message=status_message,
             stage_state=stage_state,
-            stage_label="Asking local model 1...",
+            stage_key="local_model_1",
+            stage_label=f"Asking {LOCAL_MODEL_1} to review the shared evidence.",
             model_name=LOCAL_MODEL_1,
             user_text=local_prompt,
             system_prompt=LOCAL_SYSTEM_PROMPT,
@@ -891,7 +1054,8 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         local_answer_2, local_error_2 = await run_ollama_step(
             status_message=status_message,
             stage_state=stage_state,
-            stage_label="Asking local model 2...",
+            stage_key="local_model_2",
+            stage_label=f"Asking {LOCAL_MODEL_2} to review the shared evidence.",
             model_name=LOCAL_MODEL_2,
             user_text=local_prompt,
             system_prompt=LOCAL_SYSTEM_PROMPT,
@@ -911,7 +1075,8 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         final_answer, final_error = await run_ollama_step(
             status_message=status_message,
             stage_state=stage_state,
-            stage_label="Preparing final answer...",
+            stage_key="final",
+            stage_label=f"Asking {CLOUD_MODEL} to produce the final answer.",
             model_name=CLOUD_MODEL,
             user_text=final_prompt,
             system_prompt=CLOUD_FINAL_SYSTEM_PROMPT,
@@ -928,8 +1093,10 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
                 final_error=final_error,
             )
 
-        await set_stage(status_message, stage_state, "Done. Sending answer...")
-        return final_answer
+        stage_state["detail"] = "Formatting the response for Telegram."
+        await set_stage(status_message, stage_state, "sending")
+        stage_state["completed_stages"].add("sending")
+        return final_answer, notices
 
     finally:
         stop_event.set()
@@ -992,14 +1159,17 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     async with chat_lock:
         try:
-            answer = await orchestrate_answer(user_text, recent_chat_context, status_message)
+            answer, notices = await orchestrate_answer(user_text, recent_chat_context, status_message)
             if not answer:
                 answer = "I didn't get a usable response."
         except Exception as e:
             logger.exception("Unhandled error while answering /ask.")
             await safe_edit_status_message(status_message, "Failed.")
             answer = f"Error: {e}"
+            notices = []
 
+        for notice in notices:
+            await update.message.reply_text(notice)
         save_chat_turn(chat_id, user_text, answer)
         await send_formatted_answer(update, answer)
 
