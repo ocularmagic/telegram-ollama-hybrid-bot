@@ -1,6 +1,6 @@
 # Telegram Hybrid Research Bot with Ollama + Gemini
 
-A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow.
+A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow, with an optional no-search command when you want answer-only behavior.
 
 This repo is for builders who want to learn how a hybrid local + cloud system behaves in the real world, not just how to call one model once.
 
@@ -14,6 +14,8 @@ When a user runs `/ask ...`, the bot:
 4. Sends the same evidence pool to **two local models**.
 5. Sends the evidence pool plus both local answers to **one cloud model**.
 6. Returns a final answer with staged progress updates in Telegram.
+
+When a user runs `/asknosearch ...`, the bot skips internet retrieval and answers from model knowledge plus recent chat context only.
 
 By default, the repo is configured as:
 
@@ -38,7 +40,7 @@ This is a good learning repo if you want hands-on experience with:
 ```text
 Telegram
   |
-Command-only bot (/ask, /status, /clear)
+Command-only bot (/ask, /asknosearch, /status, /clear)
   |
 Gemini 2.5 Flash search planner
   |
@@ -150,6 +152,9 @@ Shows model assignments, timeout settings, search-pool limits, and memory status
 ### `/ask your question`
 Runs the full hybrid workflow.
 
+### `/asknosearch your question`
+Skips internet search and answers from model knowledge plus chat context only.
+
 ### `/clear`
 Clears rolling memory for the current Telegram chat.
 
@@ -159,6 +164,7 @@ Recommended pattern in group chats:
 
 ```text
 /ask@your_bot_username what are the top 5 news stories from the last 72 hours?
+/asknosearch@your_bot_username explain TCP vs UDP from general knowledge
 ```
 
 Keep Telegram **Privacy Mode ON** unless you intentionally want different bot behavior in groups.
@@ -172,6 +178,7 @@ Example:
 ```text
 /ask what are the top 5 market stories this week?
 /ask give me more detail on the gold-price story you mentioned
+/asknosearch explain the last answer without using internet search
 ```
 
 This is in-memory only. If the process restarts, memory resets.
@@ -188,6 +195,8 @@ This repo uses a **shared-evidence** design:
 - The final model sees the same pool plus both local answers.
 
 That makes it easier to compare model behavior without introducing too many moving parts at once.
+
+If you intentionally want to bypass that retrieval layer, use `/asknosearch`.
 
 ### Search breadth is configurable
 

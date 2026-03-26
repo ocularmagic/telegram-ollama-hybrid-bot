@@ -46,6 +46,26 @@ class BotHelpersTest(unittest.TestCase):
             ["https://a/1", "https://b/1", "https://c/1", "https://a/2"],
         )
 
+    def test_user_requested_no_search_detects_explicit_opt_out(self):
+        self.assertTrue(bot.user_requested_no_search("Answer this, but do not search the internet."))
+        self.assertTrue(bot.user_requested_no_search("Please help without browsing the web."))
+        self.assertTrue(bot.user_requested_no_search("No internet search, just answer from what you know."))
+        self.assertFalse(bot.user_requested_no_search("Should I search the internet for this?"))
+
+    def test_usage_text_mentions_ask_no_search_command(self):
+        self.assertIn("/asknosearch your question here", bot.ASK_USAGE)
+        self.assertNotIn("--no-search", bot.ASK_USAGE)
+        self.assertIn("Use /asknosearch to answer without internet search.", bot.START_TEXT)
+
+    def test_build_no_search_pool_marks_search_as_skipped(self):
+        result = bot.build_no_search_pool("Explain TLS handshakes.", "None")
+
+        self.assertIn("Search skipped by user request", result["pool_text"])
+        self.assertIn("No external search was performed.", result["pool_text"])
+        self.assertEqual(result["metrics"]["retrieval_mode"], "Search skipped by user request")
+        self.assertEqual(result["metrics"]["planned_query_count"], 0)
+        self.assertEqual(result["metrics"]["executed_query_count"], 0)
+
     def test_build_shared_search_pool_falls_back_to_ollama_when_gemini_search_fails_generically(self):
         plan = {
             "search_objective": "Test objective",
@@ -269,6 +289,24 @@ class BotHelpersTest(unittest.TestCase):
     def test_get_chat_lock_reuses_lock_per_chat(self):
         self.assertIs(bot.get_chat_lock(1), bot.get_chat_lock(1))
         self.assertIsNot(bot.get_chat_lock(1), bot.get_chat_lock(2))
+
+    def test_cloud_final_system_prompt_prefers_detailed_synthesis(self):
+        self.assertIn("Default to a thorough answer unless the user explicitly asks for something brief.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
+        self.assertIn("Treat the local model answers as inputs, not as the finished product.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
+        self.assertIn("Add helpful context, explanation, caveats, examples, or practical next steps", bot.CLOUD_FINAL_SYSTEM_PROMPT)
+
+    def test_build_final_prompt_requests_richer_final_response(self):
+        prompt = bot.build_final_prompt(
+            question="How should I pick a laptop?",
+            recent_chat_context="User wants help choosing a work machine.",
+            shared_pool="Battery life, thermals, RAM, repairability.",
+            local_answer_1="Pick the lightest option.",
+            local_answer_2="Pick the fastest option.",
+        )
+
+        self.assertIn("SYNTHESIS GOAL:", prompt)
+        self.assertIn("Produce a richer final response than the local model drafts.", prompt)
+        self.assertIn("Do not just average the two local answers.", prompt)
 
 
 if __name__ == "__main__":
