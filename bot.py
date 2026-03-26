@@ -103,38 +103,25 @@ You will receive:
 - an answer from local model 2
 
 Your tasks:
-1. Write a very brief summary of local model 1.
-2. Write a very brief summary of local model 2.
-3. Briefly note any meaningful disagreement. If there is no meaningful disagreement, say so.
-4. Give your own full final answer, using the broad shared pool, recent chat context when relevant, and both local answers.
+- Give your own full final answer, using the broad shared pool, recent chat context when relevant, and both local answers.
 
 Rules:
 - Use the shared pool directly, not just the local summaries.
 - Prefer the strongest evidence in the pool.
 - If the question asks for ranking or selection, make your own judgment.
 - Do not mention internal implementation details.
-- Keep the summaries short, but make the final answer substantially more detailed than the local drafts when the topic benefits from it.
 - Treat the local model answers as inputs, not as the finished product.
 - Synthesize all useful information into one polished response instead of merely aggregating or compressing what the local models said.
 - Default to a thorough answer unless the user explicitly asks for something brief.
 - Add helpful context, explanation, caveats, examples, or practical next steps when they would improve the user's understanding.
 - If the evidence supports it, fill in important missing context that neither local model explained well.
-- Use clear structure in the final answer when helpful, such as short sections or bullet points.
+- Use clean, natural formatting that reads well in Telegram.
+- Do not use Markdown headings like #, ##, or ###.
+- Do not use code fences, ASCII divider lines, or decorative punctuation.
+- If section labels help, make them short and natural so they can be rendered as bold text.
 - Avoid unnecessary padding, but do not be sparse.
 
-Output exactly in this format:
-
-Local model 1 summary:
-...
-
-Local model 2 summary:
-...
-
-Differences:
-...
-
-Final answer:
-...
+Output only the final user-facing answer.
 """
 
 FAST_FINAL_SYSTEM_PROMPT = """You are the fast-answer model.
@@ -1459,23 +1446,83 @@ def render_text_chunk_as_html(text: str) -> str:
     return "".join(parts)
 
 
+def is_list_item_line(line: str) -> bool:
+    return bool(re.match(r"^([-*]|\d+\.)\s", line))
+
+
+def is_separator_line(line: str) -> bool:
+    return bool(re.fullmatch(r"[-*_=]{3,}", line.strip()))
+
+
+def normalize_display_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped:
+        return ""
+    if is_separator_line(stripped):
+        return ""
+
+    markdown_heading = re.match(r"^#{1,6}\s+(.+?)\s*$", stripped)
+    if markdown_heading:
+        return f"**{markdown_heading.group(1).strip()}**"
+
+    return stripped
+
+
+def is_standalone_emphasis_line(line: str) -> bool:
+    return bool(re.fullmatch(r"\*\*[^*\n][^*\n]{0,120}\*\*", line.strip()))
+
+
+def should_preserve_text_line(line: str) -> bool:
+    return (
+        is_list_item_line(line)
+        or line.startswith("> ")
+        or is_standalone_emphasis_line(line)
+    )
+
+
+def reflow_text_segment(text: str) -> str:
+    output_lines = []
+    paragraph_parts = []
+
+    def flush_paragraph():
+        if paragraph_parts:
+            output_lines.append(" ".join(paragraph_parts))
+            paragraph_parts.clear()
+
+    for raw_line in text.splitlines():
+        line = normalize_display_line(raw_line)
+
+        if not line:
+            flush_paragraph()
+            if output_lines and output_lines[-1] != "":
+                output_lines.append("")
+            continue
+
+        if should_preserve_text_line(line):
+            flush_paragraph()
+            output_lines.append(line)
+            continue
+
+        paragraph_parts.append(line)
+
+    flush_paragraph()
+
+    while output_lines and output_lines[-1] == "":
+        output_lines.pop()
+
+    return "\n".join(output_lines)
+
+
 async def send_formatted_answer(update: Update, answer: str) -> None:
     segments = split_answer_into_segments(answer)
 
     for kind, text in segments:
-        if kind == "table":
-            for chunk in split_text_by_lines(text, MAX_PRE_CHUNK):
-                await update.message.reply_text(
-                    f"<pre>{html.escape(chunk)}</pre>",
-                    parse_mode="HTML",
-                )
-        else:
-            normalized_text = reflow_text_segment(text)
-            for chunk in split_text_by_lines(normalized_text, MAX_TELEGRAM_CHUNK):
-                await update.message.reply_text(
-                    render_text_chunk_as_html(chunk),
-                    parse_mode="HTML",
-                )
+        normalized_text = text if kind == "table" else reflow_text_segment(text)
+        for chunk in split_text_by_lines(normalized_text, MAX_TELEGRAM_CHUNK):
+            await update.message.reply_text(
+                render_text_chunk_as_html(chunk),
+                parse_mode="HTML",
+            )
 
 
 async def safe_edit_status_message(status_message, text: str) -> None:
