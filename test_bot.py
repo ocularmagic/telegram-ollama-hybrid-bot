@@ -1,7 +1,7 @@
 import os
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot
 
@@ -153,6 +153,21 @@ class BotHelpersTest(unittest.TestCase):
                 "- Keep bullets on their own lines.\n"
                 "- Preserve list formatting."
             ),
+        )
+
+    def test_reflow_text_segment_converts_markdown_headings_and_drops_dividers(self):
+        answer = (
+            "### Overview\n"
+            "This should look like normal Telegram text.\n"
+            "---\n"
+            "More detail here."
+        )
+
+        reformatted = bot.reflow_text_segment(answer)
+
+        self.assertEqual(
+            reformatted,
+            "**Overview**\nThis should look like normal Telegram text.\n\nMore detail here.",
         )
 
     def test_render_text_chunk_as_html_converts_markdown_bold_without_literal_asterisks(self):
@@ -388,6 +403,8 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIn("Default to a thorough answer unless the user explicitly asks for something brief.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
         self.assertIn("Treat the local model answers as inputs, not as the finished product.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
         self.assertIn("Add helpful context, explanation, caveats, examples, or practical next steps", bot.CLOUD_FINAL_SYSTEM_PROMPT)
+        self.assertIn("Do not use Markdown headings like #, ##, or ###.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
+        self.assertIn("Output only the final user-facing answer.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
 
     def test_build_final_prompt_requests_richer_final_response(self):
         prompt = bot.build_final_prompt(
@@ -417,6 +434,25 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIn("FAST ANSWER GOAL:", prompt)
         self.assertIn("Use the live search pool to answer quickly and directly.", prompt)
         self.assertIn("Store hours and location details.", prompt)
+
+
+class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
+    async def test_send_formatted_answer_sends_tables_as_regular_messages_not_pre_blocks(self):
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+
+        answer = (
+            "| Item | Price |\n"
+            "| --- | --- |\n"
+            "| Soup | $9 |"
+        )
+
+        await bot.send_formatted_answer(update, answer)
+
+        first_call = update.message.reply_text.await_args_list[0]
+        self.assertEqual(first_call.kwargs["parse_mode"], "HTML")
+        self.assertNotIn("<pre>", first_call.args[0])
+        self.assertIn("| Item | Price |", first_call.args[0])
 
 
 if __name__ == "__main__":
