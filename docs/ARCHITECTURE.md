@@ -40,6 +40,24 @@ kimi-k2.5:cloud final synthesis
 Telegram response
 ```
 
+```text
+Telegram /asknosearch
+  |
+Recent per-chat memory lookup
+  |
+No web retrieval
+  |
+Synthetic "search skipped" evidence block
+  |
+qwen3:14b local answer
+  |
+gemma3:12b local answer
+  |
+kimi-k2.5:cloud final synthesis
+  |
+Telegram response
+```
+
 ## Why centralized broad retrieval?
 
 This repo intentionally uses:
@@ -71,6 +89,8 @@ The current version uses Gemini to plan the search angles instead:
 ## Why Gemini grounded search is in the loop
 
 Gemini's grounded Google Search is the retrieval layer in this repo. The bot relies on it to build the shared evidence pool before any model answers, and it also exposes the web sources used for each grounded search pass.
+
+If the user explicitly wants no browsing, `/asknosearch` skips this layer entirely.
 
 ## Memory model
 
@@ -105,3 +125,5 @@ A final reconciler that sees:
 This system is intentionally slow but thoughtful.
 
 Because the workflow is sequential, each `/ask` can run for several minutes under difficult conditions. The heartbeat/progress message is part of the design, not an afterthought.
+
+`/asknosearch` is usually faster because it avoids the search-plan and retrieval stages.

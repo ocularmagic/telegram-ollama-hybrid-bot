@@ -52,6 +52,7 @@ Good screenshots to add:
 
 - Telegram bot answering in a private chat
 - Telegram bot answering in a group with `/ask@botname ...`
+- Telegram bot answering with `/asknosearch@botname ...`
 - progress update message
 - a final answer that shows the local summaries + final synthesis
 
@@ -63,7 +64,7 @@ Before posting screenshots publicly, remove:
 
 ## 7. Suggested repo description
 
-> A Telegram research bot that combines Gemini search planning, Ollama web search, two local models, and one cloud model for final synthesis.
+> A Telegram research bot that combines Gemini search planning, grounded web retrieval, two local models, one cloud synthesis model, and a no-search answer mode.
 
 ## 8. Suggested topics
 

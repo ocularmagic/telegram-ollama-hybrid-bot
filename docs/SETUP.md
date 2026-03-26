@@ -86,12 +86,14 @@ Private chat:
 ```text
 /status
 /ask what is the latest version of Python?
+/asknosearch explain Python virtual environments from general knowledge
 ```
 
 Group chat:
 
 ```text
 /ask@your_bot_username what are the top 5 AI news stories this week?
+/asknosearch@your_bot_username explain transformers without browsing
 ```
 
 ## 10. Recommended Ollama context setting

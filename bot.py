@@ -112,7 +112,14 @@ Rules:
 - Prefer the strongest evidence in the pool.
 - If the question asks for ranking or selection, make your own judgment.
 - Do not mention internal implementation details.
-- Keep the summaries short and the final answer useful.
+- Keep the summaries short, but make the final answer substantially more detailed than the local drafts when the topic benefits from it.
+- Treat the local model answers as inputs, not as the finished product.
+- Synthesize all useful information into one polished response instead of merely aggregating or compressing what the local models said.
+- Default to a thorough answer unless the user explicitly asks for something brief.
+- Add helpful context, explanation, caveats, examples, or practical next steps when they would improve the user's understanding.
+- If the evidence supports it, fill in important missing context that neither local model explained well.
+- Use clear structure in the final answer when helpful, such as short sections or bullet points.
+- Avoid unnecessary padding, but do not be sparse.
 
 Output exactly in this format:
 
@@ -133,14 +140,17 @@ START_TEXT = (
     "Bot is working.\n\n"
     "Use /ask followed by your question.\n"
     f"In groups, use /ask@{BOT_USERNAME} your question.\n"
+    "Use /asknosearch to answer without internet search.\n"
     "Use /clear to clear this chat's rolling memory."
 )
 
 ASK_USAGE = (
     "Usage:\n"
-    "/ask your question here\n\n"
+    "/ask your question here\n"
+    "/asknosearch your question here\n\n"
     "Example:\n"
-    "/ask what are the top 5 news headlines from the last 72 hours?"
+    "/ask what are the top 5 news headlines from the last 72 hours?\n"
+    "/asknosearch explain TLS handshakes from general knowledge"
 )
 
 
@@ -163,6 +173,24 @@ def normalize_whitespace(text: str) -> str:
 
 def normalize_query_for_cache(query: str) -> str:
     return normalize_whitespace((query or "").lower())
+
+
+def user_requested_no_search(question: str) -> bool:
+    text = normalize_whitespace(question).lower()
+    if not text:
+        return False
+
+    patterns = [
+        r"\bdo not search (the )?(internet|web|online)\b",
+        r"\bdon'?t search (the )?(internet|web|online)\b",
+        r"\bno (internet|web|online) search\b",
+        r"\bwithout (searching|browsing) (the )?(internet|web|online)\b",
+        r"\bdo not browse (the )?(internet|web|online)\b",
+        r"\bdon'?t browse (the )?(internet|web|online)\b",
+        r"\bno web browsing\b",
+        r"\bno browsing\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
 
 
 def load_search_cache() -> None:
@@ -422,6 +450,49 @@ def default_search_plan(question: str) -> dict:
             {"query": f"{question} latest OR current OR recent", "purpose": "freshness/current status"},
             {"query": f"{question} comparison OR overview OR analysis", "purpose": "broader explanatory angle"},
         ],
+    }
+
+
+def build_no_search_pool(question: str, recent_chat_context: str) -> dict:
+    lines = [
+        "SEARCH OBJECTIVE",
+        "- Answer the user without performing an internet search.",
+        "",
+        "RETRIEVAL MODE",
+        "- Search skipped by user request",
+        "",
+        "RECENT CHAT CONTEXT",
+        recent_chat_context or "None",
+        "",
+        "CURRENT USER QUESTION",
+        f"- {question}",
+        "",
+        "ANSWERING CONSTRAINTS",
+        "- The user explicitly asked not to perform an internet or web search.",
+        "- Answer from existing model knowledge and recent chat context only.",
+        "- Do not imply that live browsing, grounded retrieval, or fresh web verification was performed.",
+        "- If the answer may depend on current information, say that it was not verified on the web.",
+        "",
+        "CANDIDATE RESULT POOL",
+        "- None. No external search was performed.",
+        "",
+        "GROUNDED QUERY SUMMARIES",
+        "- None. Search was intentionally skipped.",
+    ]
+
+    return {
+        "pool_text": "\n".join(lines).strip(),
+        "notices": ["Internet search skipped because the user explicitly requested no web search."],
+        "metrics": {
+            "retrieval_mode": "Search skipped by user request",
+            "cache_hit": False,
+            "planned_query_count": 0,
+            "planned_queries": [],
+            "executed_query_count": 0,
+            "unique_executed_query_count": 0,
+            "executed_queries": [],
+            "candidate_count": 0,
+        },
     }
 
 
@@ -1041,6 +1112,9 @@ def build_final_prompt(question: str, recent_chat_context: str, shared_pool: str
 CURRENT USER QUESTION:
 {question}
 
+SYNTHESIS GOAL:
+Produce a richer final response than the local model drafts. Combine the strongest evidence, resolve gaps or weak spots, and expand with useful explanation when it helps the user. Do not just average the two local answers.
+
 BROAD SHARED SEARCH POOL:
 {shared_pool}
 
@@ -1346,7 +1420,7 @@ async def run_ollama_step(
         return "", f"{stage_label} failed: {e}"
 
 
-async def orchestrate_answer(question: str, recent_chat_context: str, status_message):
+async def orchestrate_answer(question: str, recent_chat_context: str, status_message, force_no_search: bool = False):
     stage_state = {
         "stage": "starting",
         "started_at": time.monotonic(),
@@ -1357,61 +1431,69 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
     heartbeat_task = asyncio.create_task(progress_heartbeat(status_message, stage_state, stop_event))
 
     try:
-        plan, plan_error = await run_search_plan_step(
-            status_message=status_message,
-            stage_state=stage_state,
-            question=question,
-            recent_chat_context=recent_chat_context,
-            timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
-        )
-
-        if plan_error or not plan:
-            if plan_error:
-                logger.warning("Falling back to default search plan: %s", plan_error)
-            plan = default_search_plan(question)
-
-        search_result, pool_error = await run_search_pool_step(
-            status_message=status_message,
-            stage_state=stage_state,
-            question=question,
-            recent_chat_context=recent_chat_context,
-            plan=plan,
-            timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
-        )
-        shared_pool = search_result.get("pool_text", "")
-        notices = list(search_result.get("notices", []))
-        search_metrics = search_result.get("metrics", {})
-
-        if pool_error:
-            shared_pool = (
-                "SEARCH OBJECTIVE\n"
-                "- Build a broad shared search pool.\n\n"
-                "RECENT CHAT CONTEXT\n"
-                f"{recent_chat_context}\n\n"
-                "CURRENT USER QUESTION\n"
-                f"- {question}\n\n"
-                "SEARCH QUERIES\n"
-                + "\n".join(f"- {q['query']}" for q in plan.get("queries", []))
-                + "\n\nCANDIDATE RESULT POOL\n"
-                f"- Search pool generation failed: {pool_error}\n\n"
-                "GROUNDED QUERY SUMMARIES\n"
-                "- None"
+        if force_no_search or user_requested_no_search(question):
+            stage_state["detail"] = "Skipping web search because the user explicitly asked not to browse."
+            stage_state["completed_stages"].update({"planning", "search_pool"})
+            search_result = build_no_search_pool(question, recent_chat_context)
+            shared_pool = search_result.get("pool_text", "")
+            notices = list(search_result.get("notices", []))
+            search_metrics = search_result.get("metrics", {})
+        else:
+            plan, plan_error = await run_search_plan_step(
+                status_message=status_message,
+                stage_state=stage_state,
+                question=question,
+                recent_chat_context=recent_chat_context,
+                timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
             )
-            notices = []
-            search_metrics = {
-                "retrieval_mode": "Search pool unavailable",
-                "cache_hit": False,
-                "planned_query_count": len(plan.get("queries", [])),
-                "planned_queries": [
-                    normalize_whitespace(item.get("query", ""))
-                    for item in plan.get("queries", [])
-                    if normalize_whitespace(item.get("query", ""))
-                ],
-                "executed_query_count": 0,
-                "unique_executed_query_count": 0,
-                "executed_queries": [],
-                "candidate_count": 0,
-            }
+
+            if plan_error or not plan:
+                if plan_error:
+                    logger.warning("Falling back to default search plan: %s", plan_error)
+                plan = default_search_plan(question)
+
+            search_result, pool_error = await run_search_pool_step(
+                status_message=status_message,
+                stage_state=stage_state,
+                question=question,
+                recent_chat_context=recent_chat_context,
+                plan=plan,
+                timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
+            )
+            shared_pool = search_result.get("pool_text", "")
+            notices = list(search_result.get("notices", []))
+            search_metrics = search_result.get("metrics", {})
+
+            if pool_error:
+                shared_pool = (
+                    "SEARCH OBJECTIVE\n"
+                    "- Build a broad shared search pool.\n\n"
+                    "RECENT CHAT CONTEXT\n"
+                    f"{recent_chat_context}\n\n"
+                    "CURRENT USER QUESTION\n"
+                    f"- {question}\n\n"
+                    "SEARCH QUERIES\n"
+                    + "\n".join(f"- {q['query']}" for q in plan.get("queries", []))
+                    + "\n\nCANDIDATE RESULT POOL\n"
+                    f"- Search pool generation failed: {pool_error}\n\n"
+                    "GROUNDED QUERY SUMMARIES\n"
+                    "- None"
+                )
+                notices = []
+                search_metrics = {
+                    "retrieval_mode": "Search pool unavailable",
+                    "cache_hit": False,
+                    "planned_query_count": len(plan.get("queries", [])),
+                    "planned_queries": [
+                        normalize_whitespace(item.get("query", ""))
+                        for item in plan.get("queries", [])
+                        if normalize_whitespace(item.get("query", ""))
+                    ],
+                    "executed_query_count": 0,
+                    "unique_executed_query_count": 0,
+                    "executed_queries": [],
+                    "candidate_count": 0,
+                }
 
         notices.append(format_search_metrics_notice(search_metrics))
         record_search_metrics(search_metrics)
@@ -1526,8 +1608,12 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("Cleared this chat's rolling memory.")
 
 
-async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_text = " ".join(context.args).strip()
+async def handle_ask_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    force_no_search: bool = False,
+) -> None:
+    user_text = normalize_whitespace(" ".join(context.args))
 
     if not user_text:
         await update.message.reply_text(ASK_USAGE)
@@ -1549,7 +1635,12 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     async with chat_lock:
         try:
-            answer, notices = await orchestrate_answer(user_text, recent_chat_context, status_message)
+            answer, notices = await orchestrate_answer(
+                user_text,
+                recent_chat_context,
+                status_message,
+                force_no_search=force_no_search,
+            )
             if not answer:
                 answer = "I didn't get a usable response."
         except Exception as e:
@@ -1562,6 +1653,14 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(notice)
         save_chat_turn(chat_id, user_text, answer)
         await send_formatted_answer(update, answer)
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_ask_request(update, context)
+
+
+async def ask_no_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_ask_request(update, context, force_no_search=True)
 
 
 def main() -> None:
@@ -1578,6 +1677,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("ask", ask_command))
+    app.add_handler(CommandHandler("asknosearch", ask_no_search_command))
 
     print("Bot is running. Press Ctrl+C to stop.")
     app.run_polling()
