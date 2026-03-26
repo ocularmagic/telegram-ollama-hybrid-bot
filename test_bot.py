@@ -56,6 +56,11 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIn("/asknosearch your question here", bot.ASK_USAGE)
         self.assertNotIn("--no-search", bot.ASK_USAGE)
         self.assertIn("Use /asknosearch to answer without internet search.", bot.START_TEXT)
+        self.assertIn("Use /fast for a concise live-search answer.", bot.START_TEXT)
+
+    def test_fast_usage_mentions_fast_command(self):
+        self.assertIn("/fast your question here", bot.FAST_USAGE)
+        self.assertIn("Costco", bot.FAST_USAGE)
 
     def test_build_no_search_pool_marks_search_as_skipped(self):
         result = bot.build_no_search_pool("Explain TLS handshakes.", "None")
@@ -65,6 +70,29 @@ class BotHelpersTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["retrieval_mode"], "Search skipped by user request")
         self.assertEqual(result["metrics"]["planned_query_count"], 0)
         self.assertEqual(result["metrics"]["executed_query_count"], 0)
+
+    def test_split_answer_into_segments_keeps_aligned_plaintext_as_text(self):
+        answer = (
+            "Hours today  8:00 AM - 10:00 PM\n"
+            "Phone  (206) 555-1212\n"
+            "Address  123 Pike St"
+        )
+
+        segments = bot.split_answer_into_segments(answer)
+
+        self.assertEqual(segments, [("text", answer)])
+
+    def test_split_answer_into_segments_keeps_markdown_tables_as_table(self):
+        answer = (
+            "| Item | Price |\n"
+            "| --- | --- |\n"
+            "| Soup | $9 |\n"
+            "| Salad | $11 |"
+        )
+
+        segments = bot.split_answer_into_segments(answer)
+
+        self.assertEqual(segments, [("table", answer)])
 
     def test_build_shared_search_pool_falls_back_to_ollama_when_gemini_search_fails_generically(self):
         plan = {
@@ -307,6 +335,22 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIn("SYNTHESIS GOAL:", prompt)
         self.assertIn("Produce a richer final response than the local model drafts.", prompt)
         self.assertIn("Do not just average the two local answers.", prompt)
+
+    def test_fast_final_system_prompt_prefers_concise_direct_answers(self):
+        self.assertIn("answer the user's question directly and concisely", bot.FAST_FINAL_SYSTEM_PROMPT)
+        self.assertIn("prioritize concrete, current, high-signal facts", bot.FAST_FINAL_SYSTEM_PROMPT)
+        self.assertIn("do not add long analysis", bot.FAST_FINAL_SYSTEM_PROMPT)
+
+    def test_build_fast_prompt_requests_direct_live_answer(self):
+        prompt = bot.build_fast_prompt(
+            question="What time does Costco close today?",
+            recent_chat_context="None",
+            shared_pool="Store hours and location details.",
+        )
+
+        self.assertIn("FAST ANSWER GOAL:", prompt)
+        self.assertIn("Use the live search pool to answer quickly and directly.", prompt)
+        self.assertIn("Store hours and location details.", prompt)
 
 
 if __name__ == "__main__":

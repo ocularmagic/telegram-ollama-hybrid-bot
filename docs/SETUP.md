@@ -86,6 +86,7 @@ Private chat:
 ```text
 /status
 /ask what is the latest version of Python?
+/fast what time does Costco close today?
 /asknosearch explain Python virtual environments from general knowledge
 ```
 
@@ -93,6 +94,7 @@ Group chat:
 
 ```text
 /ask@your_bot_username what are the top 5 AI news stories this week?
+/fast@your_bot_username what are the hours for the Apple Store in Bellevue today?
 /asknosearch@your_bot_username explain transformers without browsing
 ```
 

@@ -58,6 +58,24 @@ kimi-k2.5:cloud final synthesis
 Telegram response
 ```
 
+```text
+Telegram /fast
+  |
+Recent per-chat memory lookup
+  |
+Gemini search-plan generation
+  |
+Gemini grounded Google Search across multiple queries
+  |
+Shared candidate pool + grounded summaries
+  |
+Skip local model debate
+  |
+kimi-k2.5:cloud concise final answer
+  |
+Telegram response
+```
+
 ## Why centralized broad retrieval?
 
 This repo intentionally uses:
@@ -91,6 +109,7 @@ The current version uses Gemini to plan the search angles instead:
 Gemini's grounded Google Search is the retrieval layer in this repo. The bot relies on it to build the shared evidence pool before any model answers, and it also exposes the web sources used for each grounded search pass.
 
 If the user explicitly wants no browsing, `/asknosearch` skips this layer entirely.
+If the user wants a quick live answer, `/fast` still uses this retrieval layer but skips the local-model comparison.
 
 ## Memory model
 
@@ -127,3 +146,4 @@ This system is intentionally slow but thoughtful.
 Because the workflow is sequential, each `/ask` can run for several minutes under difficult conditions. The heartbeat/progress message is part of the design, not an afterthought.
 
 `/asknosearch` is usually faster because it avoids the search-plan and retrieval stages.
+`/fast` is usually faster than `/ask` because it keeps live search but skips the two local-model passes.

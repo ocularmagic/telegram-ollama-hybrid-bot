@@ -1,6 +1,6 @@
 # Telegram Hybrid Research Bot with Ollama + Gemini
 
-A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow, with an optional no-search command when you want answer-only behavior.
+A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow, with both a fast live-search mode and an optional no-search mode.
 
 This repo is for builders who want to learn how a hybrid local + cloud system behaves in the real world, not just how to call one model once.
 
@@ -16,6 +16,8 @@ When a user runs `/ask ...`, the bot:
 6. Returns a final answer with staged progress updates in Telegram.
 
 When a user runs `/asknosearch ...`, the bot skips internet retrieval and answers from model knowledge plus recent chat context only.
+
+When a user runs `/fast ...`, the bot keeps live search but skips the two local-model review steps and asks Kimi for a concise answer.
 
 By default, the repo is configured as:
 
@@ -40,7 +42,7 @@ This is a good learning repo if you want hands-on experience with:
 ```text
 Telegram
   |
-Command-only bot (/ask, /asknosearch, /status, /clear)
+Command-only bot (/ask, /fast, /asknosearch, /status, /clear)
   |
 Gemini 2.5 Flash search planner
   |
@@ -152,6 +154,9 @@ Shows model assignments, timeout settings, search-pool limits, and memory status
 ### `/ask your question`
 Runs the full hybrid workflow.
 
+### `/fast your question`
+Runs live search, skips the local-model debate, and returns a concise answer.
+
 ### `/asknosearch your question`
 Skips internet search and answers from model knowledge plus chat context only.
 
@@ -164,6 +169,7 @@ Recommended pattern in group chats:
 
 ```text
 /ask@your_bot_username what are the top 5 news stories from the last 72 hours?
+/fast@your_bot_username what are the hours for Pike Place Chowder today?
 /asknosearch@your_bot_username explain TCP vs UDP from general knowledge
 ```
 
@@ -177,6 +183,7 @@ Example:
 
 ```text
 /ask what are the top 5 market stories this week?
+/fast what time does Costco close today?
 /ask give me more detail on the gold-price story you mentioned
 /asknosearch explain the last answer without using internet search
 ```
@@ -197,6 +204,7 @@ This repo uses a **shared-evidence** design:
 That makes it easier to compare model behavior without introducing too many moving parts at once.
 
 If you intentionally want to bypass that retrieval layer, use `/asknosearch`.
+If you want live data without the full multi-model analysis, use `/fast`.
 
 ### Search breadth is configurable
 
