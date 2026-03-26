@@ -9,6 +9,7 @@ import threading
 import urllib.parse
 import urllib.request
 import urllib.error
+from datetime import datetime, timedelta
 
 from telegram import Update
 from telegram.error import BadRequest
@@ -199,6 +200,26 @@ def normalize_whitespace(text: str) -> str:
 
 def normalize_query_for_cache(query: str) -> str:
     return normalize_whitespace((query or "").lower())
+
+
+def format_absolute_date(dt: datetime) -> str:
+    return dt.strftime("%A, %B %d, %Y")
+
+
+def build_current_date_context(now: datetime | None = None) -> str:
+    local_now = now.astimezone() if now else datetime.now().astimezone()
+    today = local_now.date()
+    yesterday = today - timedelta(days=1)
+    tomorrow = today + timedelta(days=1)
+
+    return (
+        "CURRENT LOCAL DATE CONTEXT\n"
+        f"- Today is {format_absolute_date(datetime.combine(today, datetime.min.time(), tzinfo=local_now.tzinfo))}.\n"
+        f"- Yesterday was {format_absolute_date(datetime.combine(yesterday, datetime.min.time(), tzinfo=local_now.tzinfo))}.\n"
+        f"- Tomorrow is {format_absolute_date(datetime.combine(tomorrow, datetime.min.time(), tzinfo=local_now.tzinfo))}.\n"
+        "- Use these absolute dates to resolve phrases like today, yesterday, tomorrow, this week, and last week.\n"
+        "- Do not second-guess these dates unless the user explicitly gives a different date reference."
+    )
 
 
 def user_requested_no_search(question: str) -> bool:
@@ -480,9 +501,12 @@ def default_search_plan(question: str) -> dict:
 
 
 def build_no_search_pool(question: str, recent_chat_context: str) -> dict:
+    current_date_context = build_current_date_context()
     lines = [
         "SEARCH OBJECTIVE",
         "- Answer the user without performing an internet search.",
+        "",
+        current_date_context,
         "",
         "RETRIEVAL MODE",
         "- Search skipped by user request",
@@ -648,6 +672,7 @@ def format_recent_chat_context(chat_id: int) -> str:
 
 def generate_search_plan(question: str, recent_chat_context: str) -> dict:
     client = get_gemini_client()
+    current_date_context = build_current_date_context()
 
     prompt = f"""You are a search-planning model.
 
@@ -676,6 +701,8 @@ Rules:
 - Keep queries practical for web search.
 - No markdown.
 - No explanation outside JSON.
+
+{current_date_context}
 
 RECENT CHAT CONTEXT:
 {recent_chat_context}
@@ -719,6 +746,7 @@ CURRENT USER QUESTION:
 
 def gemini_grounded_search(question: str, recent_chat_context: str, plan: dict) -> dict:
     client = get_gemini_client()
+    current_date_context = build_current_date_context()
     query_lines = []
     for idx, item in enumerate(plan.get("queries", [])[:SEARCH_QUERY_LIMIT], start=1):
         query_lines.append(f"Q{idx}: {normalize_whitespace(item.get('query', ''))}")
@@ -741,6 +769,8 @@ def gemini_grounded_search(question: str, recent_chat_context: str, plan: dict) 
 
     Keep the response concise, factual, and optimized as a retrieval summary rather than a final polished answer.
     Mention notable tradeoffs, uncertainty, and strong source categories that appeared in search.
+
+{current_date_context}
 
 RECENT CHAT CONTEXT:
 {recent_chat_context}
@@ -877,6 +907,7 @@ def choose_fetch_candidates(query_buckets: list, fetch_limit: int) -> list:
 
 def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict) -> dict:
     queries = plan.get("queries", [])[:SEARCH_QUERY_LIMIT]
+    current_date_context = build_current_date_context()
 
     all_candidates = []
     deduped_by_url = {}
@@ -990,6 +1021,8 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
     lines = []
     lines.append("SEARCH OBJECTIVE")
     lines.append(f"- {plan.get('search_objective', 'Build a broad search pool.')}")
+    lines.append("")
+    lines.append(current_date_context)
     lines.append("")
     lines.append("RETRIEVAL MODE")
     lines.append(f"- {retrieval_label}")
@@ -1111,11 +1144,14 @@ def call_ollama_model(model_name: str, user_text: str, system_prompt: str) -> st
 
 
 def build_local_prompt(question: str, recent_chat_context: str, shared_pool: str) -> str:
+    current_date_context = build_current_date_context()
     return f"""Answer the user's current question using the broad shared search pool below.
 
 Use your own judgment.
 If the question asks for ranking, selection, prioritization, or \"top\" items, make your own independent choice from the pool.
 Use recent chat context only when it helps resolve a follow-up reference.
+
+{current_date_context}
 
 RECENT CHAT CONTEXT:
 {recent_chat_context}
@@ -1132,7 +1168,10 @@ Do not mention other models.
 
 
 def build_final_prompt(question: str, recent_chat_context: str, shared_pool: str, local_answer_1: str, local_answer_2: str) -> str:
-    return f"""RECENT CHAT CONTEXT:
+    current_date_context = build_current_date_context()
+    return f"""{current_date_context}
+
+RECENT CHAT CONTEXT:
 {recent_chat_context}
 
 CURRENT USER QUESTION:
@@ -1153,7 +1192,10 @@ LOCAL MODEL 2 ({LOCAL_MODEL_2}) ANSWER:
 
 
 def build_fast_prompt(question: str, recent_chat_context: str, shared_pool: str) -> str:
-    return f"""RECENT CHAT CONTEXT:
+    current_date_context = build_current_date_context()
+    return f"""{current_date_context}
+
+RECENT CHAT CONTEXT:
 {recent_chat_context}
 
 CURRENT USER QUESTION:
