@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import bot
@@ -70,6 +71,45 @@ class BotHelpersTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["retrieval_mode"], "Search skipped by user request")
         self.assertEqual(result["metrics"]["planned_query_count"], 0)
         self.assertEqual(result["metrics"]["executed_query_count"], 0)
+
+    def test_build_current_date_context_uses_absolute_dates(self):
+        now = datetime(2026, 3, 26, 15, 30, tzinfo=timezone.utc)
+
+        context = bot.build_current_date_context(now)
+
+        self.assertIn("Today is Thursday, March 26, 2026.", context)
+        self.assertIn("Yesterday was Wednesday, March 25, 2026.", context)
+        self.assertIn("Tomorrow is Friday, March 27, 2026.", context)
+
+    def test_build_local_prompt_includes_current_date_context(self):
+        with patch("bot.build_current_date_context", return_value="CURRENT LOCAL DATE CONTEXT\n- Today is Thursday, March 26, 2026."):
+            prompt = bot.build_local_prompt(
+                question="What is the weather today?",
+                recent_chat_context="None",
+                shared_pool="Weather results.",
+            )
+
+        self.assertIn("CURRENT LOCAL DATE CONTEXT", prompt)
+        self.assertIn("Today is Thursday, March 26, 2026.", prompt)
+
+    def test_build_shared_search_pool_includes_current_date_context(self):
+        plan = {
+            "search_objective": "Test objective",
+            "queries": [{"query": "weather today", "purpose": "direct angle"}],
+        }
+
+        with patch("bot.build_current_date_context", return_value="CURRENT LOCAL DATE CONTEXT\n- Today is Thursday, March 26, 2026."), patch(
+            "bot.gemini_grounded_search",
+            return_value={
+                "summary": "Weather summary",
+                "results": [{"title": "Forecast", "url": "https://example.com/weather"}],
+                "executed_queries": ["weather today"],
+            },
+        ):
+            search_result = bot.build_shared_search_pool("What is the weather today?", "None", plan)
+
+        self.assertIn("CURRENT LOCAL DATE CONTEXT", search_result["pool_text"])
+        self.assertIn("Today is Thursday, March 26, 2026.", search_result["pool_text"])
 
     def test_split_answer_into_segments_keeps_aligned_plaintext_as_text(self):
         answer = (
