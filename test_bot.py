@@ -134,6 +134,32 @@ class BotHelpersTest(unittest.TestCase):
 
         self.assertEqual(segments, [("table", answer)])
 
+    def test_reflow_text_segment_merges_wrapped_prose_into_full_paragraphs(self):
+        answer = (
+            "**Overview:** This response was wrapped\n"
+            "too early and should use the full width\n"
+            "of the Telegram bubble.\n\n"
+            "- Keep bullets on their own lines.\n"
+            "- Preserve list formatting."
+        )
+
+        reformatted = bot.reflow_text_segment(answer)
+
+        self.assertEqual(
+            reformatted,
+            (
+                "**Overview:** This response was wrapped too early and should use the full width "
+                "of the Telegram bubble.\n\n"
+                "- Keep bullets on their own lines.\n"
+                "- Preserve list formatting."
+            ),
+        )
+
+    def test_render_text_chunk_as_html_converts_markdown_bold_without_literal_asterisks(self):
+        rendered = bot.render_text_chunk_as_html("**Overview:** Wider text & safer formatting.")
+
+        self.assertEqual(rendered, "<b>Overview:</b> Wider text &amp; safer formatting.")
+
     def test_build_shared_search_pool_falls_back_to_ollama_when_gemini_search_fails_generically(self):
         plan = {
             "search_objective": "Test objective",

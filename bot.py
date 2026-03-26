@@ -1401,6 +1401,64 @@ def split_text_by_lines(text: str, max_len: int):
     return chunks
 
 
+def is_list_item_line(line: str) -> bool:
+    return bool(re.match(r"^([-*•]|\d+\.)\s", line))
+
+
+def should_preserve_text_line(line: str) -> bool:
+    return (
+        is_list_item_line(line)
+        or line.startswith("> ")
+        or line.startswith("#")
+    )
+
+
+def reflow_text_segment(text: str) -> str:
+    output_lines = []
+    paragraph_parts = []
+
+    def flush_paragraph():
+        if paragraph_parts:
+            output_lines.append(" ".join(paragraph_parts))
+            paragraph_parts.clear()
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            flush_paragraph()
+            if output_lines and output_lines[-1] != "":
+                output_lines.append("")
+            continue
+
+        if should_preserve_text_line(line):
+            flush_paragraph()
+            output_lines.append(line)
+            continue
+
+        paragraph_parts.append(line)
+
+    flush_paragraph()
+
+    while output_lines and output_lines[-1] == "":
+        output_lines.pop()
+
+    return "\n".join(output_lines)
+
+
+def render_text_chunk_as_html(text: str) -> str:
+    parts = []
+    cursor = 0
+
+    for match in re.finditer(r"\*\*(.+?)\*\*", text, flags=re.DOTALL):
+        parts.append(html.escape(text[cursor:match.start()]))
+        parts.append(f"<b>{html.escape(match.group(1).strip())}</b>")
+        cursor = match.end()
+
+    parts.append(html.escape(text[cursor:]))
+    return "".join(parts)
+
+
 async def send_formatted_answer(update: Update, answer: str) -> None:
     segments = split_answer_into_segments(answer)
 
@@ -1412,8 +1470,12 @@ async def send_formatted_answer(update: Update, answer: str) -> None:
                     parse_mode="HTML",
                 )
         else:
-            for chunk in split_text_by_lines(text, MAX_TELEGRAM_CHUNK):
-                await update.message.reply_text(chunk)
+            normalized_text = reflow_text_segment(text)
+            for chunk in split_text_by_lines(normalized_text, MAX_TELEGRAM_CHUNK):
+                await update.message.reply_text(
+                    render_text_chunk_as_html(chunk),
+                    parse_mode="HTML",
+                )
 
 
 async def safe_edit_status_message(status_message, text: str) -> None:
