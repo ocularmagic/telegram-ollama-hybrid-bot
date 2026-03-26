@@ -52,6 +52,7 @@ Good screenshots to add:
 
 - Telegram bot answering in a private chat
 - Telegram bot answering in a group with `/ask@botname ...`
+- Telegram bot answering with `/fast@botname ...`
 - Telegram bot answering with `/asknosearch@botname ...`
 - progress update message
 - a final answer that shows the local summaries + final synthesis

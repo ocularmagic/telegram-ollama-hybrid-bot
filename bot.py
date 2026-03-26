@@ -136,9 +136,28 @@ Final answer:
 ...
 """
 
+FAST_FINAL_SYSTEM_PROMPT = """You are the fast-answer model.
+
+You will receive:
+- the user's current question
+- recent chat context from this Telegram chat
+- a broad shared search pool gathered from live web retrieval
+
+Your job:
+- answer the user's question directly and concisely
+- prioritize concrete, current, high-signal facts from the shared pool
+- for operational questions like hours, menu items, prices, addresses, availability, or contact details, lead with the exact answer the user likely wants
+- mention uncertainty briefly if the search pool is ambiguous, stale, or conflicting
+- do not add long analysis, local-model summaries, or unnecessary background
+- do not mention internal implementation details
+
+Output only the user-facing answer.
+"""
+
 START_TEXT = (
     "Bot is working.\n\n"
     "Use /ask followed by your question.\n"
+    "Use /fast for a concise live-search answer.\n"
     f"In groups, use /ask@{BOT_USERNAME} your question.\n"
     "Use /asknosearch to answer without internet search.\n"
     "Use /clear to clear this chat's rolling memory."
@@ -151,6 +170,13 @@ ASK_USAGE = (
     "Example:\n"
     "/ask what are the top 5 news headlines from the last 72 hours?\n"
     "/asknosearch explain TLS handshakes from general knowledge"
+)
+
+FAST_USAGE = (
+    "Usage:\n"
+    "/fast your question here\n\n"
+    "Example:\n"
+    "/fast what are the hours for Costco in Seattle today?"
 )
 
 
@@ -1126,6 +1152,21 @@ LOCAL MODEL 2 ({LOCAL_MODEL_2}) ANSWER:
 """
 
 
+def build_fast_prompt(question: str, recent_chat_context: str, shared_pool: str) -> str:
+    return f"""RECENT CHAT CONTEXT:
+{recent_chat_context}
+
+CURRENT USER QUESTION:
+{question}
+
+FAST ANSWER GOAL:
+Use the live search pool to answer quickly and directly. Prefer the specific operational detail the user is likely asking for over broad analysis.
+
+BROAD SHARED SEARCH POOL:
+{shared_pool}
+"""
+
+
 def build_fallback_answer(
     question: str,
     shared_pool: str,
@@ -1150,10 +1191,21 @@ def build_fallback_answer(
     )
 
 
+def build_fast_fallback_answer(question: str, shared_pool: str, final_error: str) -> str:
+    return (
+        "I could not complete the fast cloud answer step.\n"
+        f"Cloud error: {final_error}\n\n"
+        f"Question:\n{question}\n\n"
+        "Live search pool:\n"
+        f"{shared_pool}"
+    )
+
+
 def format_progress_text(stage_state: dict) -> str:
     elapsed = int(time.monotonic() - stage_state["started_at"])
     current_stage = stage_state["stage"]
     completed = stage_state.get("completed_stages", set())
+    skipped = stage_state.get("skipped_stages", set())
     detail = stage_state.get("detail", "")
 
     lines = [
@@ -1165,6 +1217,8 @@ def format_progress_text(stage_state: dict) -> str:
     for stage_key, label in PROGRESS_STAGES:
         if stage_key in completed:
             prefix = "[x]"
+        elif stage_key in skipped:
+            prefix = "[-]"
         elif stage_key == current_stage:
             prefix = "[>]"
         else:
@@ -1209,7 +1263,6 @@ def is_table_line(line: str) -> bool:
     return (
         is_markdown_table_line(line)
         or is_table_separator_line(line)
-        or is_aligned_table_line(line)
     )
 
 
@@ -1420,91 +1473,111 @@ async def run_ollama_step(
         return "", f"{stage_label} failed: {e}"
 
 
+async def prepare_shared_pool(
+    question: str,
+    recent_chat_context: str,
+    status_message,
+    stage_state: dict,
+    allow_no_search: bool = False,
+    force_no_search: bool = False,
+):
+    if allow_no_search and (force_no_search or user_requested_no_search(question)):
+        stage_state["detail"] = "Skipping web search because the user explicitly asked not to browse."
+        stage_state["completed_stages"].update({"planning", "search_pool"})
+        search_result = build_no_search_pool(question, recent_chat_context)
+        shared_pool = search_result.get("pool_text", "")
+        notices = list(search_result.get("notices", []))
+        search_metrics = search_result.get("metrics", {})
+    else:
+        plan, plan_error = await run_search_plan_step(
+            status_message=status_message,
+            stage_state=stage_state,
+            question=question,
+            recent_chat_context=recent_chat_context,
+            timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
+        )
+
+        if plan_error or not plan:
+            if plan_error:
+                logger.warning("Falling back to default search plan: %s", plan_error)
+            plan = default_search_plan(question)
+
+        search_result, pool_error = await run_search_pool_step(
+            status_message=status_message,
+            stage_state=stage_state,
+            question=question,
+            recent_chat_context=recent_chat_context,
+            plan=plan,
+            timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
+        )
+        shared_pool = search_result.get("pool_text", "")
+        notices = list(search_result.get("notices", []))
+        search_metrics = search_result.get("metrics", {})
+
+        if pool_error:
+            shared_pool = (
+                "SEARCH OBJECTIVE\n"
+                "- Build a broad shared search pool.\n\n"
+                "RECENT CHAT CONTEXT\n"
+                f"{recent_chat_context}\n\n"
+                "CURRENT USER QUESTION\n"
+                f"- {question}\n\n"
+                "SEARCH QUERIES\n"
+                + "\n".join(f"- {q['query']}" for q in plan.get("queries", []))
+                + "\n\nCANDIDATE RESULT POOL\n"
+                f"- Search pool generation failed: {pool_error}\n\n"
+                "GROUNDED QUERY SUMMARIES\n"
+                "- None"
+            )
+            notices = []
+            search_metrics = {
+                "retrieval_mode": "Search pool unavailable",
+                "cache_hit": False,
+                "planned_query_count": len(plan.get("queries", [])),
+                "planned_queries": [
+                    normalize_whitespace(item.get("query", ""))
+                    for item in plan.get("queries", [])
+                    if normalize_whitespace(item.get("query", ""))
+                ],
+                "executed_query_count": 0,
+                "unique_executed_query_count": 0,
+                "executed_queries": [],
+                "candidate_count": 0,
+            }
+
+    notices.append(format_search_metrics_notice(search_metrics))
+    record_search_metrics(search_metrics)
+    logger.info(
+        "Search metrics | mode=%s planned=%s executed_total=%s executed_unique=%s candidates=%s queries=%s",
+        search_metrics.get("retrieval_mode", "unknown"),
+        search_metrics.get("planned_query_count", 0),
+        search_metrics.get("executed_query_count", 0),
+        search_metrics.get("unique_executed_query_count", 0),
+        search_metrics.get("candidate_count", 0),
+        search_metrics.get("executed_queries", []),
+    )
+    return shared_pool, notices
+
+
 async def orchestrate_answer(question: str, recent_chat_context: str, status_message, force_no_search: bool = False):
     stage_state = {
         "stage": "starting",
         "started_at": time.monotonic(),
         "completed_stages": set(),
+        "skipped_stages": set(),
         "detail": "Request received. Initializing pipeline.",
     }
     stop_event = asyncio.Event()
     heartbeat_task = asyncio.create_task(progress_heartbeat(status_message, stage_state, stop_event))
 
     try:
-        if force_no_search or user_requested_no_search(question):
-            stage_state["detail"] = "Skipping web search because the user explicitly asked not to browse."
-            stage_state["completed_stages"].update({"planning", "search_pool"})
-            search_result = build_no_search_pool(question, recent_chat_context)
-            shared_pool = search_result.get("pool_text", "")
-            notices = list(search_result.get("notices", []))
-            search_metrics = search_result.get("metrics", {})
-        else:
-            plan, plan_error = await run_search_plan_step(
-                status_message=status_message,
-                stage_state=stage_state,
-                question=question,
-                recent_chat_context=recent_chat_context,
-                timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
-            )
-
-            if plan_error or not plan:
-                if plan_error:
-                    logger.warning("Falling back to default search plan: %s", plan_error)
-                plan = default_search_plan(question)
-
-            search_result, pool_error = await run_search_pool_step(
-                status_message=status_message,
-                stage_state=stage_state,
-                question=question,
-                recent_chat_context=recent_chat_context,
-                plan=plan,
-                timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
-            )
-            shared_pool = search_result.get("pool_text", "")
-            notices = list(search_result.get("notices", []))
-            search_metrics = search_result.get("metrics", {})
-
-            if pool_error:
-                shared_pool = (
-                    "SEARCH OBJECTIVE\n"
-                    "- Build a broad shared search pool.\n\n"
-                    "RECENT CHAT CONTEXT\n"
-                    f"{recent_chat_context}\n\n"
-                    "CURRENT USER QUESTION\n"
-                    f"- {question}\n\n"
-                    "SEARCH QUERIES\n"
-                    + "\n".join(f"- {q['query']}" for q in plan.get("queries", []))
-                    + "\n\nCANDIDATE RESULT POOL\n"
-                    f"- Search pool generation failed: {pool_error}\n\n"
-                    "GROUNDED QUERY SUMMARIES\n"
-                    "- None"
-                )
-                notices = []
-                search_metrics = {
-                    "retrieval_mode": "Search pool unavailable",
-                    "cache_hit": False,
-                    "planned_query_count": len(plan.get("queries", [])),
-                    "planned_queries": [
-                        normalize_whitespace(item.get("query", ""))
-                        for item in plan.get("queries", [])
-                        if normalize_whitespace(item.get("query", ""))
-                    ],
-                    "executed_query_count": 0,
-                    "unique_executed_query_count": 0,
-                    "executed_queries": [],
-                    "candidate_count": 0,
-                }
-
-        notices.append(format_search_metrics_notice(search_metrics))
-        record_search_metrics(search_metrics)
-        logger.info(
-            "Search metrics | mode=%s planned=%s executed_total=%s executed_unique=%s candidates=%s queries=%s",
-            search_metrics.get("retrieval_mode", "unknown"),
-            search_metrics.get("planned_query_count", 0),
-            search_metrics.get("executed_query_count", 0),
-            search_metrics.get("unique_executed_query_count", 0),
-            search_metrics.get("candidate_count", 0),
-            search_metrics.get("executed_queries", []),
+        shared_pool, notices = await prepare_shared_pool(
+            question=question,
+            recent_chat_context=recent_chat_context,
+            status_message=status_message,
+            stage_state=stage_state,
+            allow_no_search=True,
+            force_no_search=force_no_search,
         )
 
         local_prompt = build_local_prompt(question, recent_chat_context, shared_pool)
@@ -1574,6 +1647,59 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         await heartbeat_task
 
 
+async def orchestrate_fast_answer(question: str, recent_chat_context: str, status_message):
+    stage_state = {
+        "stage": "starting",
+        "started_at": time.monotonic(),
+        "completed_stages": set(),
+        "skipped_stages": {"local_model_1", "local_model_2"},
+        "detail": "Request received. Preparing fast live-search answer.",
+    }
+    stop_event = asyncio.Event()
+    heartbeat_task = asyncio.create_task(progress_heartbeat(status_message, stage_state, stop_event))
+
+    try:
+        shared_pool, notices = await prepare_shared_pool(
+            question=question,
+            recent_chat_context=recent_chat_context,
+            status_message=status_message,
+            stage_state=stage_state,
+            allow_no_search=False,
+            force_no_search=False,
+        )
+
+        fast_prompt = build_fast_prompt(question, recent_chat_context, shared_pool)
+        stage_state["detail"] = "Skipping local model debate for a concise fast answer."
+
+        final_answer, final_error = await run_ollama_step(
+            status_message=status_message,
+            stage_state=stage_state,
+            stage_key="final",
+            stage_label=f"Asking {CLOUD_MODEL} for a concise fast answer.",
+            model_name=CLOUD_MODEL,
+            user_text=fast_prompt,
+            system_prompt=FAST_FINAL_SYSTEM_PROMPT,
+            timeout_seconds=FINAL_TIMEOUT_SECONDS,
+        )
+
+        if final_error:
+            logger.warning("Fast cloud answer failed, building fallback answer: %s", final_error)
+            final_answer = build_fast_fallback_answer(
+                question=question,
+                shared_pool=shared_pool,
+                final_error=final_error,
+            )
+
+        stage_state["detail"] = "Formatting the response for Telegram."
+        await set_stage(status_message, stage_state, "sending")
+        stage_state["completed_stages"].add("sending")
+        return final_answer, notices
+
+    finally:
+        stop_event.set()
+        await heartbeat_task
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(START_TEXT)
 
@@ -1612,11 +1738,13 @@ async def handle_ask_request(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     force_no_search: bool = False,
+    fast_mode: bool = False,
+    usage_text: str = ASK_USAGE,
 ) -> None:
     user_text = normalize_whitespace(" ".join(context.args))
 
     if not user_text:
-        await update.message.reply_text(ASK_USAGE)
+        await update.message.reply_text(usage_text)
         return
 
     chat_id = update.effective_chat.id
@@ -1625,7 +1753,7 @@ async def handle_ask_request(
 
     if chat_lock.locked():
         await update.message.reply_text(
-            "A previous /ask is still running for this chat. Wait for it to finish or use /clear after it completes."
+            "A previous request is still running for this chat. Wait for it to finish or use /clear after it completes."
         )
         return
 
@@ -1635,16 +1763,23 @@ async def handle_ask_request(
 
     async with chat_lock:
         try:
-            answer, notices = await orchestrate_answer(
-                user_text,
-                recent_chat_context,
-                status_message,
-                force_no_search=force_no_search,
-            )
+            if fast_mode:
+                answer, notices = await orchestrate_fast_answer(
+                    user_text,
+                    recent_chat_context,
+                    status_message,
+                )
+            else:
+                answer, notices = await orchestrate_answer(
+                    user_text,
+                    recent_chat_context,
+                    status_message,
+                    force_no_search=force_no_search,
+                )
             if not answer:
                 answer = "I didn't get a usable response."
         except Exception as e:
-            logger.exception("Unhandled error while answering /ask.")
+            logger.exception("Unhandled error while answering request.")
             await safe_edit_status_message(status_message, "Failed.")
             answer = f"Error: {e}"
             notices = []
@@ -1663,6 +1798,10 @@ async def ask_no_search_command(update: Update, context: ContextTypes.DEFAULT_TY
     await handle_ask_request(update, context, force_no_search=True)
 
 
+async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_ask_request(update, context, fast_mode=True, usage_text=FAST_USAGE)
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1678,6 +1817,7 @@ def main() -> None:
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("asknosearch", ask_no_search_command))
+    app.add_handler(CommandHandler("fast", fast_command))
 
     print("Bot is running. Press Ctrl+C to stop.")
     app.run_polling()
