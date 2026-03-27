@@ -36,11 +36,11 @@ You need:
 
 - `TELEGRAM_BOT_TOKEN`
 - `BOT_USERNAME`
-- `GEMINI_API_KEY`
+- `TAVILY_API_KEY`
 
 Optional:
 
-- `OLLAMA_API_KEY` if you want Ollama web-search fallback when Gemini quota is exhausted
+- `OLLAMA_API_KEY` if you want Ollama web-search fallback when Tavily is unavailable
 
 ## 5. Install Python dependencies
 
@@ -57,7 +57,7 @@ Example variables:
 ```env
 TELEGRAM_BOT_TOKEN=...
 BOT_USERNAME=...
-GEMINI_API_KEY=...
+TAVILY_API_KEY=...
 OLLAMA_API_KEY=...
 ```
 

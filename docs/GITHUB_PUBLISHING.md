@@ -20,7 +20,7 @@ Before your first push, verify that none of these contain real values:
 - copied terminal history
 - usernames or hostnames you don’t want public
 - actual bot token
-- Gemini API key
+- Tavily API key
 - Ollama API key
 
 This repo intentionally includes only `.env.example`, not `.env`.
@@ -65,13 +65,13 @@ Before posting screenshots publicly, remove:
 
 ## 7. Suggested repo description
 
-> A Telegram research bot that combines Gemini search planning, grounded web retrieval, two local models, one cloud synthesis model, and a no-search answer mode.
+> A Telegram research bot that combines built-in search planning, Tavily live web retrieval, two local models, one cloud synthesis model, and a no-search answer mode.
 
 ## 8. Suggested topics
 
 - telegram-bot
 - ollama
-- gemini
+- tavily
 - local-llm
 - ai-agents
 - python

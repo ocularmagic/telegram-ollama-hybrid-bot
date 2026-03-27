@@ -25,11 +25,11 @@ Telegram /ask
   |
 Recent per-chat memory lookup
   |
-Gemini search-plan generation
+Built-in search-plan generation
   |
-Gemini grounded Google Search across multiple queries
+Tavily live web search across multiple queries
   |
-Shared candidate pool + grounded summaries
+Shared candidate pool + search summaries
   |
 qwen3:14b local answer
   |
@@ -63,11 +63,11 @@ Telegram /fast
   |
 Recent per-chat memory lookup
   |
-Gemini search-plan generation
+Built-in search-plan generation
   |
-Gemini grounded Google Search across multiple queries
+Tavily live web search across multiple queries
   |
-Shared candidate pool + grounded summaries
+Shared candidate pool + search summaries
   |
 Skip local model debate
   |
@@ -90,13 +90,11 @@ That is a stronger default than letting every model search independently because
 - makes the local comparison more meaningful
 - keeps the system easier to debug
 
-## Why Gemini is only the planner now
+## Why planning is built in now
 
-Earlier versions used Gemini as the evidence summarizer.
+Earlier versions used a cloud planner in the search stack.
 
-That was useful, but it compressed the search universe too early. The local models were often judging a summary of the world, not a larger pool of candidate sources.
-
-The current version uses Gemini to plan the search angles instead:
+The current version keeps planning local and deterministic instead:
 
 - direct angle
 - freshness/current angle
@@ -104,9 +102,9 @@ The current version uses Gemini to plan the search angles instead:
 - comparison/overview angle
 - follow-up resolution when prior context matters
 
-## Why Gemini grounded search is in the loop
+## Why Tavily search is in the loop
 
-Gemini's grounded Google Search is the retrieval layer in this repo. The bot relies on it to build the shared evidence pool before any model answers, and it also exposes the web sources used for each grounded search pass.
+Tavily is the retrieval layer in this repo. The bot relies on it to build the shared evidence pool before any model answers, and it also exposes the web sources used for each search pass.
 
 If the user explicitly wants no browsing, `/asknosearch` skips this layer entirely.
 If the user wants a quick live answer, `/fast` still uses this retrieval layer but skips the local-model comparison.

@@ -99,11 +99,13 @@ class BotHelpersTest(unittest.TestCase):
         }
 
         with patch("bot.build_current_date_context", return_value="CURRENT LOCAL DATE CONTEXT\n- Today is Thursday, March 26, 2026."), patch(
-            "bot.gemini_grounded_search",
+            "bot.tavily_search_pool",
             return_value={
-                "summary": "Weather summary",
+                "summaries": [{"query": "weather today", "purpose": "direct angle", "topic": "news", "summary": "Weather summary"}],
                 "results": [{"title": "Forecast", "url": "https://example.com/weather"}],
                 "executed_queries": ["weather today"],
+                "errors": [],
+                "credits_used": 1.0,
             },
         ):
             search_result = bot.build_shared_search_pool("What is the weather today?", "None", plan)
@@ -175,7 +177,7 @@ class BotHelpersTest(unittest.TestCase):
 
         self.assertEqual(rendered, "<b>Overview:</b> Wider text &amp; safer formatting.")
 
-    def test_build_shared_search_pool_falls_back_to_ollama_when_gemini_search_fails_generically(self):
+    def test_build_shared_search_pool_falls_back_to_ollama_when_tavily_search_fails_generically(self):
         plan = {
             "search_objective": "Test objective",
             "queries": [
@@ -189,7 +191,7 @@ class BotHelpersTest(unittest.TestCase):
             if question == "question":
                 raise RuntimeError("boom")
 
-        with patch("bot.gemini_grounded_search", side_effect=fake_search), patch(
+        with patch("bot.tavily_search_pool", side_effect=fake_search), patch(
             "bot.ollama_search_pool",
             return_value={
                 "summary": "Fallback retrieval from Ollama web search.",
@@ -201,14 +203,14 @@ class BotHelpersTest(unittest.TestCase):
             search_result = bot.build_shared_search_pool("question", "None", plan)
             shared_pool = search_result["pool_text"]
 
-        self.assertIn("Gemini grounded search failed. Fell back to Ollama web search.", search_result["notices"])
+        self.assertIn("Tavily search failed. Fell back to Ollama web search.", search_result["notices"])
         self.assertIn("Ollama web search fallback", shared_pool)
         self.assertIn("Fallback Result", shared_pool)
         self.assertEqual(search_result["metrics"]["planned_query_count"], 2)
         self.assertEqual(search_result["metrics"]["executed_query_count"], 2)
         self.assertEqual(search_result["metrics"]["unique_executed_query_count"], 2)
 
-    def test_build_shared_search_pool_collects_results_from_single_grounded_call(self):
+    def test_build_shared_search_pool_collects_results_from_tavily_search(self):
         plan = {
             "search_objective": "Test objective",
             "queries": [
@@ -218,32 +220,37 @@ class BotHelpersTest(unittest.TestCase):
         }
 
         with patch(
-            "bot.gemini_grounded_search",
+            "bot.tavily_search_pool",
             return_value={
-                "summary": "Combined grounded summary",
+                "summaries": [
+                    {"query": "query one", "purpose": "first angle", "topic": "general", "summary": "Combined Tavily summary"}
+                ],
                 "results": [{"title": "Good Result", "url": "https://example.com/good"}],
                 "executed_queries": ["query one", "query two"],
+                "errors": [],
+                "credits_used": 2.0,
             },
         ):
             search_result = bot.build_shared_search_pool("question", "None", plan)
             shared_pool = search_result["pool_text"]
 
         self.assertIn("Good Result", shared_pool)
-        self.assertIn("Combined grounded summary", shared_pool)
-        self.assertIn("Google queries: query one, query two", shared_pool)
+        self.assertIn("Combined Tavily summary", shared_pool)
+        self.assertIn("Query: query one", shared_pool)
         self.assertEqual(search_result["metrics"]["planned_query_count"], 2)
         self.assertEqual(search_result["metrics"]["executed_query_count"], 2)
         self.assertEqual(search_result["metrics"]["unique_executed_query_count"], 2)
+        self.assertEqual(search_result["metrics"]["credits_used"], 2.0)
 
-    def test_build_shared_search_pool_falls_back_to_ollama_when_gemini_quota_exhausted(self):
+    def test_build_shared_search_pool_falls_back_to_ollama_when_tavily_search_errors(self):
         plan = {
             "search_objective": "Test objective",
             "queries": [{"query": "query one", "purpose": "first angle"}],
         }
 
         with patch(
-            "bot.gemini_grounded_search",
-            side_effect=bot.GeminiQuotaExceededError("429 RESOURCE_EXHAUSTED"),
+            "bot.tavily_search_pool",
+            side_effect=bot.TavilySearchError("429 rate limit"),
         ), patch(
             "bot.ollama_search_pool",
             return_value={
@@ -255,33 +262,7 @@ class BotHelpersTest(unittest.TestCase):
         ):
             search_result = bot.build_shared_search_pool("question", "None", plan)
 
-        self.assertIn("Gemini search quota exhausted. Fell back to Ollama web search.", search_result["notices"])
-        self.assertIn("Ollama web search fallback", search_result["pool_text"])
-        self.assertIn("Fallback Result", search_result["pool_text"])
-        self.assertEqual(search_result["metrics"]["planned_query_count"], 1)
-        self.assertEqual(search_result["metrics"]["executed_query_count"], 1)
-
-    def test_build_shared_search_pool_falls_back_to_ollama_when_gemini_search_returns_503(self):
-        plan = {
-            "search_objective": "Test objective",
-            "queries": [{"query": "query one", "purpose": "first angle"}],
-        }
-
-        with patch(
-            "bot.gemini_grounded_search",
-            side_effect=bot.GeminiSearchUnavailableError("503 UNAVAILABLE"),
-        ), patch(
-            "bot.ollama_search_pool",
-            return_value={
-                "summary": "Fallback retrieval from Ollama web search.",
-                "results": [{"title": "Fallback Result", "url": "https://example.com/fallback"}],
-                "executed_queries": ["query one"],
-                "errors": [],
-            },
-        ):
-            search_result = bot.build_shared_search_pool("question", "None", plan)
-
-        self.assertIn("Gemini grounded search returned 503. Fell back to Ollama web search.", search_result["notices"])
+        self.assertIn("Tavily search failed. Fell back to Ollama web search.", search_result["notices"])
         self.assertIn("Ollama web search fallback", search_result["pool_text"])
         self.assertIn("Fallback Result", search_result["pool_text"])
         self.assertEqual(search_result["metrics"]["planned_query_count"], 1)
@@ -290,13 +271,14 @@ class BotHelpersTest(unittest.TestCase):
     def test_format_search_metrics_notice_lists_executed_queries(self):
         notice = bot.format_search_metrics_notice(
             {
-                "retrieval_mode": "Gemini grounded search",
+                "retrieval_mode": "Tavily search",
                 "cache_hit": False,
                 "planned_query_count": 3,
                 "executed_query_count": 5,
                 "unique_executed_query_count": 4,
                 "candidate_count": 7,
                 "executed_queries": ["query one", "query two"],
+                "credits_used": 2.0,
             }
         )
 
@@ -304,6 +286,7 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIn("Cache hit: no", notice)
         self.assertIn("Planned queries: 3", notice)
         self.assertIn("Executed queries: 5 total (4 unique)", notice)
+        self.assertIn("Tavily credits used: 2.00", notice)
         self.assertIn("1. query one", notice)
 
     def test_build_shared_search_pool_uses_cache_on_repeat_request(self):
@@ -313,11 +296,13 @@ class BotHelpersTest(unittest.TestCase):
         }
 
         with patch(
-            "bot.gemini_grounded_search",
+            "bot.tavily_search_pool",
             return_value={
-                "summary": "Combined grounded summary",
+                "summaries": [{"query": "query one", "purpose": "first angle", "topic": "general", "summary": "Combined Tavily summary"}],
                 "results": [{"title": "Good Result", "url": "https://example.com/good"}],
                 "executed_queries": ["query one"],
+                "errors": [],
+                "credits_used": 1.0,
             },
         ) as mock_search:
             first_result = bot.build_shared_search_pool("question", "None", plan)
@@ -340,17 +325,18 @@ class BotHelpersTest(unittest.TestCase):
         self.assertFalse(first_response["cache_hit"])
         self.assertTrue(second_response["cache_hit"])
 
-    def test_record_search_metrics_counts_google_and_cache_usage(self):
+    def test_record_search_metrics_counts_tavily_and_cache_usage(self):
         bot.record_search_metrics(
             {
-                "retrieval_mode": "Gemini grounded search",
+                "retrieval_mode": "Tavily search",
                 "cache_hit": False,
                 "executed_query_count": 3,
+                "credits_used": 1.5,
             }
         )
         bot.record_search_metrics(
             {
-                "retrieval_mode": "Gemini grounded search (cached)",
+                "retrieval_mode": "Tavily search (cached)",
                 "cache_hit": True,
                 "executed_query_count": 3,
             }
@@ -366,25 +352,33 @@ class BotHelpersTest(unittest.TestCase):
         stats = bot.get_today_search_stats()
 
         self.assertEqual(stats["ask_count"], 3)
-        self.assertEqual(stats["google_uncached_asks"], 1)
-        self.assertEqual(stats["google_executed_queries"], 3)
+        self.assertEqual(stats["tavily_uncached_asks"], 1)
+        self.assertEqual(stats["tavily_executed_queries"], 3)
+        self.assertEqual(stats["tavily_credits_used"], 1.5)
         self.assertEqual(stats["cache_hit_asks"], 1)
         self.assertEqual(stats["fallback_asks"], 1)
 
     def test_format_today_search_stats_includes_estimate(self):
+        original_limit = bot.TAVILY_DAILY_CREDIT_LIMIT
+        bot.TAVILY_DAILY_CREDIT_LIMIT = 10.0
         bot.record_search_metrics(
             {
-                "retrieval_mode": "Gemini grounded search",
+                "retrieval_mode": "Tavily search",
                 "cache_hit": False,
                 "executed_query_count": 4,
+                "credits_used": 2.0,
             }
         )
 
-        text = bot.format_today_search_stats()
+        try:
+            text = bot.format_today_search_stats()
+        finally:
+            bot.TAVILY_DAILY_CREDIT_LIMIT = original_limit
 
-        self.assertIn("Google executed queries today: 4/", text)
-        self.assertIn("Avg Google queries per uncached ask: 4.00", text)
-        self.assertIn("Estimated uncached asks remaining before limit:", text)
+        self.assertIn("Tavily executed queries today: 4", text)
+        self.assertIn("Avg Tavily queries per uncached ask: 4.00", text)
+        self.assertIn("Tavily credits used today: 2.00/10.00", text)
+        self.assertIn("Estimated uncached asks remaining before credit budget:", text)
 
     def test_save_chat_turn_trims_history(self):
         for index in range(bot.MAX_HISTORY_TURNS + 2):
@@ -402,7 +396,9 @@ class BotHelpersTest(unittest.TestCase):
     def test_cloud_final_system_prompt_prefers_detailed_synthesis(self):
         self.assertIn("Default to a thorough answer unless the user explicitly asks for something brief.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
         self.assertIn("Treat the local model answers as inputs, not as the finished product.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
-        self.assertIn("Add helpful context, explanation, caveats, examples, or practical next steps", bot.CLOUD_FINAL_SYSTEM_PROMPT)
+        self.assertIn("Prioritize correctness over speed or confidence.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
+        self.assertIn("Be explicit about uncertainty.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
+        self.assertIn("For factual claims based on the shared pool, cite the source inline", bot.CLOUD_FINAL_SYSTEM_PROMPT)
         self.assertIn("Do not use Markdown headings like #, ##, or ###.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
         self.assertIn("Output only the final user-facing answer.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
 
@@ -423,6 +419,8 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIn("answer the user's question directly and concisely", bot.FAST_FINAL_SYSTEM_PROMPT)
         self.assertIn("prioritize concrete, current, high-signal facts", bot.FAST_FINAL_SYSTEM_PROMPT)
         self.assertIn("do not add long analysis", bot.FAST_FINAL_SYSTEM_PROMPT)
+        self.assertIn("cite the source inline for factual claims", bot.FAST_FINAL_SYSTEM_PROMPT)
+        self.assertIn("use measured confidence, not absolute certainty", bot.FAST_FINAL_SYSTEM_PROMPT)
 
     def test_build_fast_prompt_requests_direct_live_answer(self):
         prompt = bot.build_fast_prompt(

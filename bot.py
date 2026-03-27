@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import json
 import html
@@ -15,8 +15,6 @@ from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from ollama import chat
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -33,9 +31,11 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "qwen3:14b")
 LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "gemma3:12b")
 CLOUD_MODEL = os.getenv("CLOUD_MODEL", "kimi-k2.5:cloud")
-SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", "gemini-2.5-flash")
-SEARCH_RETRIEVAL_MODEL = os.getenv("SEARCH_RETRIEVAL_MODEL", SEARCH_PLANNER_MODEL)
+SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", "built-in")
+SEARCH_RETRIEVAL_MODEL = os.getenv("SEARCH_RETRIEVAL_MODEL", "tavily-search")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot_username")
+TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
+TAVILY_DAILY_CREDIT_LIMIT = float(os.getenv("TAVILY_DAILY_CREDIT_LIMIT", "0"))
 
 MAX_TELEGRAM_CHUNK = 3500
 MAX_PRE_CHUNK = 3000
@@ -53,7 +53,6 @@ FETCH_CONTENT_LIMIT = int(os.getenv("FETCH_CONTENT_LIMIT", "900"))
 SEARCH_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "43200"))
 SEARCH_CACHE_PATH = os.getenv("SEARCH_CACHE_PATH", "search_cache.json")
 SEARCH_STATS_PATH = os.getenv("SEARCH_STATS_PATH", "search_stats.json")
-GOOGLE_DAILY_QUERY_LIMIT = int(os.getenv("GOOGLE_DAILY_QUERY_LIMIT", "500"))
 
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "3"))
 MEMORY_QUESTION_CHARS = int(os.getenv("MEMORY_QUESTION_CHARS", "1200"))
@@ -93,7 +92,7 @@ Your job:
 Keep the answer concise but useful.
 """
 
-CLOUD_FINAL_SYSTEM_PROMPT = """You are the final synthesis model.
+CLOUD_FINAL_SYSTEM_PROMPT = """You are a precise, high-trust AI assistant producing the final synthesis answer.
 
 You will receive:
 - the user's current question
@@ -106,25 +105,37 @@ Your tasks:
 - Give your own full final answer, using the broad shared pool, recent chat context when relevant, and both local answers.
 
 Rules:
+- Prioritize correctness over speed or confidence.
+- Be direct, clear, and useful.
 - Use the shared pool directly, not just the local summaries.
 - Prefer the strongest evidence in the pool.
+- Prefer official or primary sources when the pool includes them.
 - If the question asks for ranking or selection, make your own judgment.
+- If comparing options, normalize the comparison criteria before concluding and pick a winner when the evidence supports it.
 - Do not mention internal implementation details.
 - Treat the local model answers as inputs, not as the finished product.
 - Synthesize all useful information into one polished response instead of merely aggregating or compressing what the local models said.
 - Default to a thorough answer unless the user explicitly asks for something brief.
-- Add helpful context, explanation, caveats, examples, or practical next steps when they would improve the user's understanding.
+- Add helpful context, explanation, caveats, examples, or practical next steps only when they improve the user's understanding.
 - If the evidence supports it, fill in important missing context that neither local model explained well.
+- Be explicit about uncertainty. State what is known, what is uncertain, and what would verify it when that distinction matters.
+- Separate facts, inferences, and recommendations when doing so improves clarity.
+- For factual claims based on the shared pool, cite the source inline in a short form such as "(Source: example.com)".
+- Never invent citations, data, events, or capabilities.
+- Do not claim you verified something live unless it is supported by the shared pool.
+- Use measured confidence, not absolute certainty.
+- Start with the conclusion or direct answer when that improves clarity.
 - Use clean, natural formatting that reads well in Telegram.
 - Do not use Markdown headings like #, ##, or ###.
 - Do not use code fences, ASCII divider lines, or decorative punctuation.
 - If section labels help, make them short and natural so they can be rendered as bold text.
 - Avoid unnecessary padding, but do not be sparse.
+- Avoid filler, hype, exaggerated praise, and motivational language.
 
 Output only the final user-facing answer.
 """
 
-FAST_FINAL_SYSTEM_PROMPT = """You are the fast-answer model.
+FAST_FINAL_SYSTEM_PROMPT = """You are a precise, high-trust AI assistant producing a fast answer.
 
 You will receive:
 - the user's current question
@@ -135,9 +146,13 @@ Your job:
 - answer the user's question directly and concisely
 - prioritize concrete, current, high-signal facts from the shared pool
 - for operational questions like hours, menu items, prices, addresses, availability, or contact details, lead with the exact answer the user likely wants
+- cite the source inline for factual claims from the shared pool using a short form such as "(Source: example.com)"
 - mention uncertainty briefly if the search pool is ambiguous, stale, or conflicting
+- say what would verify the answer if the evidence is incomplete or conflicting
+- never invent citations, facts, or verification steps
 - do not add long analysis, local-model summaries, or unnecessary background
 - do not mention internal implementation details
+- use measured confidence, not absolute certainty
 
 Output only the user-facing answer.
 """
@@ -168,11 +183,7 @@ FAST_USAGE = (
 )
 
 
-class GeminiQuotaExceededError(RuntimeError):
-    pass
-
-
-class GeminiSearchUnavailableError(RuntimeError):
+class TavilySearchError(RuntimeError):
     pass
 
 
@@ -297,9 +308,9 @@ def set_search_cache_entry(cache_key: str, value: dict) -> None:
         persist_search_cache()
 
 
-def build_grounded_search_cache_key(question: str, recent_chat_context: str, plan: dict) -> str:
+def build_search_pool_cache_key(question: str, recent_chat_context: str, plan: dict) -> str:
     payload = {
-        "kind": "grounded_search",
+        "kind": "search_pool",
         "model": SEARCH_RETRIEVAL_MODEL,
         "question": normalize_query_for_cache(question),
         "recent_chat_context": normalize_query_for_cache(recent_chat_context),
@@ -359,8 +370,9 @@ def today_key() -> str:
 def default_daily_search_stats() -> dict:
     return {
         "ask_count": 0,
-        "google_uncached_asks": 0,
-        "google_executed_queries": 0,
+        "tavily_uncached_asks": 0,
+        "tavily_executed_queries": 0,
+        "tavily_credits_used": 0.0,
         "cache_hit_asks": 0,
         "fallback_asks": 0,
     }
@@ -388,10 +400,13 @@ def record_search_metrics(metrics: dict) -> None:
         if retrieval_mode == "Ollama web search fallback":
             entry["fallback_asks"] = int(entry.get("fallback_asks", 0)) + 1
 
-        if retrieval_mode == "Gemini grounded search" and not cache_hit:
-            entry["google_uncached_asks"] = int(entry.get("google_uncached_asks", 0)) + 1
-            entry["google_executed_queries"] = int(entry.get("google_executed_queries", 0)) + int(
+        if retrieval_mode == "Tavily search" and not cache_hit:
+            entry["tavily_uncached_asks"] = int(entry.get("tavily_uncached_asks", 0)) + 1
+            entry["tavily_executed_queries"] = int(entry.get("tavily_executed_queries", 0)) + int(
                 metrics.get("executed_query_count", 0)
+            )
+            entry["tavily_credits_used"] = float(entry.get("tavily_credits_used", 0.0)) + float(
+                metrics.get("credits_used", 0.0)
             )
 
         persist_search_stats()
@@ -410,32 +425,46 @@ def get_today_search_stats() -> dict:
 def format_today_search_stats() -> str:
     stats = get_today_search_stats()
     ask_count = int(stats.get("ask_count", 0))
-    google_uncached_asks = int(stats.get("google_uncached_asks", 0))
-    google_executed_queries = int(stats.get("google_executed_queries", 0))
+    tavily_uncached_asks = int(stats.get("tavily_uncached_asks", 0))
+    tavily_executed_queries = int(stats.get("tavily_executed_queries", 0))
+    tavily_credits_used = float(stats.get("tavily_credits_used", 0.0))
     cache_hit_asks = int(stats.get("cache_hit_asks", 0))
     fallback_asks = int(stats.get("fallback_asks", 0))
-    remaining_google_queries = max(0, GOOGLE_DAILY_QUERY_LIMIT - google_executed_queries)
+    remaining_tavily_credits = max(0.0, TAVILY_DAILY_CREDIT_LIMIT - tavily_credits_used)
 
-    if google_uncached_asks > 0:
-        avg_queries_per_uncached_ask = google_executed_queries / google_uncached_asks
-        estimated_remaining_uncached_asks = int(remaining_google_queries / avg_queries_per_uncached_ask) if avg_queries_per_uncached_ask > 0 else 0
+    if tavily_uncached_asks > 0:
+        avg_queries_per_uncached_ask = tavily_executed_queries / tavily_uncached_asks
+        avg_credits_per_uncached_ask = tavily_credits_used / tavily_uncached_asks
+        if TAVILY_DAILY_CREDIT_LIMIT > 0 and avg_credits_per_uncached_ask > 0:
+            estimated_remaining_uncached_asks = int(remaining_tavily_credits / avg_credits_per_uncached_ask)
+        else:
+            estimated_remaining_uncached_asks = 0
         avg_text = f"{avg_queries_per_uncached_ask:.2f}"
+        avg_credits_text = f"{avg_credits_per_uncached_ask:.2f}"
     else:
-        avg_queries_per_uncached_ask = 0.0
-        estimated_remaining_uncached_asks = GOOGLE_DAILY_QUERY_LIMIT
+        estimated_remaining_uncached_asks = 0
         avg_text = "0.00"
+        avg_credits_text = "0.00"
 
     cache_hit_rate = (cache_hit_asks / ask_count * 100.0) if ask_count > 0 else 0.0
+    if TAVILY_DAILY_CREDIT_LIMIT > 0:
+        budget_line = f"Tavily credits used today: {tavily_credits_used:.2f}/{TAVILY_DAILY_CREDIT_LIMIT:.2f}"
+        remaining_line = f"Estimated uncached asks remaining before credit budget: {estimated_remaining_uncached_asks}"
+    else:
+        budget_line = f"Tavily credits used today: {tavily_credits_used:.2f} (no daily credit budget configured)"
+        remaining_line = "Estimated uncached asks remaining before credit budget: not configured"
 
     return (
         f"Daily search stats ({today_key()})\n"
         f"Total asks today: {ask_count}\n"
-        f"Google uncached asks today: {google_uncached_asks}\n"
-        f"Google executed queries today: {google_executed_queries}/{GOOGLE_DAILY_QUERY_LIMIT}\n"
+        f"Tavily uncached asks today: {tavily_uncached_asks}\n"
+        f"Tavily executed queries today: {tavily_executed_queries}\n"
+        f"{budget_line}\n"
         f"Cache-hit asks today: {cache_hit_asks} ({cache_hit_rate:.1f}%)\n"
         f"Ollama fallback asks today: {fallback_asks}\n"
-        f"Avg Google queries per uncached ask: {avg_text}\n"
-        f"Estimated uncached asks remaining before limit: {estimated_remaining_uncached_asks}"
+        f"Avg Tavily queries per uncached ask: {avg_text}\n"
+        f"Avg Tavily credits per uncached ask: {avg_credits_text}\n"
+        f"{remaining_line}"
     )
 
 
@@ -472,7 +501,7 @@ def extract_json_object(text: str):
         except Exception:
             pass
 
-    raise ValueError("Could not parse JSON from Gemini response.")
+    raise ValueError("Could not parse JSON from planner response.")
 
 
 def default_search_plan(question: str) -> dict:
@@ -507,13 +536,13 @@ def build_no_search_pool(question: str, recent_chat_context: str) -> dict:
         "ANSWERING CONSTRAINTS",
         "- The user explicitly asked not to perform an internet or web search.",
         "- Answer from existing model knowledge and recent chat context only.",
-        "- Do not imply that live browsing, grounded retrieval, or fresh web verification was performed.",
+        "- Do not imply that live browsing, Tavily retrieval, or fresh web verification was performed.",
         "- If the answer may depend on current information, say that it was not verified on the web.",
         "",
         "CANDIDATE RESULT POOL",
         "- None. No external search was performed.",
         "",
-        "GROUNDED QUERY SUMMARIES",
+        "SEARCH QUERY SUMMARIES",
         "- None. Search was intentionally skipped.",
     ]
 
@@ -533,26 +562,33 @@ def build_no_search_pool(question: str, recent_chat_context: str) -> dict:
     }
 
 
-def get_gemini_client():
-    api_key = os.getenv("GEMINI_API_KEY")
+def tavily_api_post(path: str, payload: dict) -> dict:
+    api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set.")
-    return genai.Client()
+        raise RuntimeError("TAVILY_API_KEY is not set.")
 
+    url = f"https://api.tavily.com/{path}"
+    data = json.dumps(payload).encode("utf-8")
 
-def get_grounding_tool():
-    return types.Tool(google_search=types.GoogleSearch())
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
 
-
-def is_gemini_quota_error(error: Exception) -> bool:
-    text = str(error or "")
-    return "RESOURCE_EXHAUSTED" in text or ("429" in text and "quota" in text.lower())
-
-
-def is_gemini_search_503_error(error: Exception) -> bool:
-    text = str(error or "")
-    upper_text = text.upper()
-    return "503" in text or "HTTP 503" in upper_text or "UNAVAILABLE" in upper_text
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        raise TavilySearchError(f"Tavily API HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise TavilySearchError(f"Tavily API connection error: {e}")
 
 
 def ollama_api_post(path: str, payload: dict) -> dict:
@@ -658,60 +694,11 @@ def format_recent_chat_context(chat_id: int) -> str:
 
 
 def generate_search_plan(question: str, recent_chat_context: str) -> dict:
-    client = get_gemini_client()
-    current_date_context = build_current_date_context()
-
-    prompt = f"""You are a search-planning model.
-
-Create a broad search plan for the user's current question.
-Use the recent chat context only when it helps interpret a follow-up question.
-Do NOT answer the question.
-Return VALID JSON ONLY with this exact shape:
-
-{{
-  \"search_objective\": \"short description\",
-  \"queries\": [
-    {{
-      \"query\": \"search query text\",
-      \"purpose\": \"why this query exists\"
-    }}
-  ]
-}}
-
-Rules:
-- Create 4 to 6 diverse queries.
-- Prefer breadth over a single narrow query.
-- Include an official/primary-source query when relevant.
-- Include a freshness/current-status query when relevant.
-- Include alternate wording or alternate angles when helpful.
-- If the current question is a follow-up, use recent chat context to resolve references like \"that\", \"it\", or \"you mentioned\".
-- Keep queries practical for web search.
-- No markdown.
-- No explanation outside JSON.
-
-{current_date_context}
-
-RECENT CHAT CONTEXT:
-{recent_chat_context}
-
-CURRENT USER QUESTION:
-{question}
-"""
-
-    response = client.models.generate_content(
-        model=SEARCH_PLANNER_MODEL,
-        contents=prompt,
-    )
-
-    text = (response.text or "").strip()
-    plan = extract_json_object(text)
-
-    queries = plan.get("queries", [])
+    _ = recent_chat_context
+    plan = default_search_plan(question)
     cleaned_queries = []
 
-    for item in queries:
-        if not isinstance(item, dict):
-            continue
+    for item in plan.get("queries", []):
         query = normalize_whitespace(item.get("query", ""))
         purpose = normalize_whitespace(item.get("purpose", ""))
         if query:
@@ -722,99 +709,113 @@ CURRENT USER QUESTION:
                 }
             )
 
-    if not cleaned_queries:
-        return default_search_plan(question)
-
     return {
         "search_objective": normalize_whitespace(plan.get("search_objective", "")) or "Build a broad, multi-angle search pool.",
         "queries": cleaned_queries[:SEARCH_QUERY_LIMIT],
     }
 
 
-def gemini_grounded_search(question: str, recent_chat_context: str, plan: dict) -> dict:
-    client = get_gemini_client()
-    current_date_context = build_current_date_context()
-    query_lines = []
-    for idx, item in enumerate(plan.get("queries", [])[:SEARCH_QUERY_LIMIT], start=1):
-        query_lines.append(f"Q{idx}: {normalize_whitespace(item.get('query', ''))}")
-        query_lines.append(f"Purpose: {normalize_whitespace(item.get('purpose', '')) or 'general angle'}")
-        query_lines.append("")
+def is_freshness_sensitive_query(text: str) -> bool:
+    normalized = normalize_query_for_cache(text)
+    freshness_terms = [
+        "today",
+        "latest",
+        "current",
+        "recent",
+        "news",
+        "headline",
+        "this week",
+        "last week",
+        "last 24 hours",
+        "last 48 hours",
+        "last 72 hours",
+        "breaking",
+    ]
+    return any(term in normalized for term in freshness_terms)
 
-    prompt = f"""Use Google Search grounding to gather a broad evidence pool for the user's question.
 
-    Do not answer the user fully yet.
-    Use the search plan below as guidance and try to cover its distinct angles in one grounded pass.
-    Focus on collecting useful facts and relevant web sources for the overall question.
-    Prefer breadth and diversity of sources over repeating one angle.
+def infer_tavily_topic(question: str, query: str) -> str:
+    return "news" if is_freshness_sensitive_query(question) or is_freshness_sensitive_query(query) else "general"
 
-    Retrieval goals:
-    - cover the direct query
-    - include official or primary sources when relevant
-    - include current or recent sources when freshness matters
-    - include comparison, overview, or buyer-guide style sources when the user is choosing between options
-    - surface distinct relevant sources rather than near-duplicates
 
-    Keep the response concise, factual, and optimized as a retrieval summary rather than a final polished answer.
-    Mention notable tradeoffs, uncertainty, and strong source categories that appeared in search.
+def tavily_search_pool(question: str, recent_chat_context: str, plan: dict) -> dict:
+    _ = recent_chat_context
+    all_candidates = []
+    deduped_by_url = {}
+    search_errors = []
+    executed_queries = []
+    query_summaries = []
+    credits_used = 0.0
 
-{current_date_context}
-
-RECENT CHAT CONTEXT:
-{recent_chat_context}
-
-CURRENT USER QUESTION:
-{question}
-
-SEARCH PLAN:
-{chr(10).join(query_lines).strip() or "No explicit search plan provided."}
-"""
-
-    try:
-        response = client.models.generate_content(
-            model=SEARCH_RETRIEVAL_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(tools=[get_grounding_tool()]),
-        )
-    except Exception as e:
-        if is_gemini_quota_error(e):
-            raise GeminiQuotaExceededError(str(e)) from e
-        if is_gemini_search_503_error(e):
-            raise GeminiSearchUnavailableError(str(e)) from e
-        raise
-
-    candidates = getattr(response, "candidates", None) or []
-    grounding_metadata = None
-    if candidates:
-        grounding_metadata = getattr(candidates[0], "grounding_metadata", None)
-
-    web_search_queries = []
-    grounding_chunks = []
-    if grounding_metadata:
-        web_search_queries = getattr(grounding_metadata, "web_search_queries", None) or []
-        grounding_chunks = getattr(grounding_metadata, "grounding_chunks", None) or []
-
-    results = []
-    for chunk in grounding_chunks:
-        web = getattr(chunk, "web", None)
-        if not web:
+    for idx, query_item in enumerate(plan.get("queries", [])[:SEARCH_QUERY_LIMIT], start=1):
+        query_text = normalize_whitespace(query_item.get("query", ""))
+        purpose = normalize_whitespace(query_item.get("purpose", "")) or "general angle"
+        if not query_text:
             continue
 
-        url = normalize_whitespace(getattr(web, "uri", "") or "")
-        if not url:
+        executed_queries.append(query_text)
+        topic = infer_tavily_topic(question, query_text)
+
+        try:
+            response = tavily_api_post(
+                "search",
+                {
+                    "query": query_text,
+                    "search_depth": TAVILY_SEARCH_DEPTH,
+                    "topic": topic,
+                    "max_results": max(1, min(SEARCH_RESULTS_PER_QUERY, 20)),
+                    "include_answer": "basic",
+                    "include_usage": True,
+                },
+            )
+        except Exception as e:
+            logger.warning("Tavily search failed for %r: %s", query_text, e)
+            search_errors.append(f"Q{idx} failed: {e}")
             continue
 
-        results.append(
-            {
-                "title": normalize_whitespace(getattr(web, "title", "") or "") or "Untitled result",
+        usage = response.get("usage", {}) or {}
+        credits_used += float(usage.get("credits", 0.0) or 0.0)
+
+        summary_text = truncate_text(normalize_whitespace(response.get("answer", "")), FETCH_CONTENT_LIMIT)
+        if summary_text:
+            query_summaries.append(
+                {
+                    "query": query_text,
+                    "purpose": purpose,
+                    "topic": topic,
+                    "summary": summary_text,
+                }
+            )
+
+        for rank, result in enumerate(response.get("results", []) or [], start=1):
+            title = normalize_whitespace(result.get("title", ""))
+            url = normalize_whitespace(result.get("url", ""))
+            snippet = truncate_text(normalize_whitespace(result.get("content", "")), SEARCH_SNIPPET_LIMIT)
+
+            if not url:
+                continue
+
+            candidate = {
+                "query_index": idx,
+                "query_text": query_text,
+                "purpose": purpose,
+                "rank_within_query": rank,
+                "title": title or "Untitled result",
                 "url": url,
                 "source": domain_from_url(url),
+                "snippet": snippet,
             }
-        )
+
+            if url not in deduped_by_url and len(all_candidates) < TOTAL_CANDIDATE_LIMIT:
+                deduped_by_url[url] = candidate
+                all_candidates.append(candidate)
 
     return {
-        "summary": truncate_text(normalize_whitespace(response.text or ""), FETCH_CONTENT_LIMIT),
-        "results": results[:TOTAL_CANDIDATE_LIMIT],
-        "executed_queries": [normalize_whitespace(item) for item in web_search_queries if normalize_whitespace(item)],
+        "summaries": query_summaries,
+        "results": all_candidates,
+        "executed_queries": executed_queries,
+        "errors": search_errors,
+        "credits_used": credits_used,
     }
 
 
@@ -895,115 +896,76 @@ def choose_fetch_candidates(query_buckets: list, fetch_limit: int) -> list:
 def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict) -> dict:
     queries = plan.get("queries", [])[:SEARCH_QUERY_LIMIT]
     current_date_context = build_current_date_context()
-
-    all_candidates = []
-    deduped_by_url = {}
-    search_errors = []
-    grounded_summaries = []
     notices = []
-    retrieval_label = "Gemini grounded search"
+    retrieval_label = "Tavily search"
     cache_hit = False
+    credits_used = 0.0
 
-    def fallback_to_ollama(gemini_error: Exception, notice_message: str, fallback_unavailable_notice: str, fallback_error_prefix: str):
+    def fallback_to_ollama(search_error: Exception, notice_message: str, fallback_unavailable_notice: str, fallback_error_prefix: str):
         nonlocal retrieval_label
         retrieval_label = "Ollama web search fallback"
         try:
             fallback_response = ollama_search_pool(question, plan)
-            search_errors.extend(fallback_response.get("errors", []))
             notices.append(notice_message)
             return fallback_response
         except Exception as fallback_error:
-            logger.warning("Ollama fallback search failed after Gemini error: %s", fallback_error)
+            logger.warning("Ollama fallback search failed after Tavily error: %s", fallback_error)
             notices.append(fallback_unavailable_notice)
-            search_errors.append(f"{fallback_error_prefix}: {gemini_error}")
-            search_errors.append(f"Fallback search failed: {fallback_error}")
-            return {"summary": "", "results": [], "executed_queries": []}
+            return {
+                "summaries": [],
+                "results": [],
+                "executed_queries": [],
+                "errors": [
+                    f"{fallback_error_prefix}: {search_error}",
+                    f"Fallback search failed: {fallback_error}",
+                ],
+                "credits_used": 0.0,
+            }
 
-    grounded_cache_key = build_grounded_search_cache_key(question, recent_chat_context, plan)
-    cached_grounded_response = get_search_cache_entry(grounded_cache_key)
-    if cached_grounded_response:
-        search_response = cached_grounded_response
-        retrieval_label = "Gemini grounded search (cached)"
+    search_pool_cache_key = build_search_pool_cache_key(question, recent_chat_context, plan)
+    cached_search_response = get_search_cache_entry(search_pool_cache_key)
+    if cached_search_response:
+        search_response = cached_search_response
+        retrieval_label = "Tavily search (cached)"
         cache_hit = True
     else:
         try:
-            search_response = gemini_grounded_search(question, recent_chat_context, plan)
+            search_response = tavily_search_pool(question, recent_chat_context, plan)
             set_search_cache_entry(
-                grounded_cache_key,
+                search_pool_cache_key,
                 {
-                    "summary": search_response.get("summary", ""),
+                    "summaries": search_response.get("summaries", []) or [],
                     "results": search_response.get("results", []) or [],
                     "executed_queries": search_response.get("executed_queries", []) or [],
+                    "errors": search_response.get("errors", []) or [],
+                    "credits_used": search_response.get("credits_used", 0.0) or 0.0,
                 },
             )
-        except GeminiQuotaExceededError as e:
-            logger.warning("Gemini grounded search quota exhausted: %s", e)
-            search_response = fallback_to_ollama(
-                gemini_error=e,
-                notice_message="Gemini search quota exhausted. Fell back to Ollama web search.",
-                fallback_unavailable_notice=(
-                    "Gemini search quota exhausted, and Ollama web-search fallback was unavailable. "
-                    "Add OLLAMA_API_KEY or wait for Gemini quota reset."
-                ),
-                fallback_error_prefix="Gemini search quota exhausted",
-            )
-        except GeminiSearchUnavailableError as e:
-            logger.warning("Gemini grounded search returned 503/unavailable: %s", e)
-            search_response = fallback_to_ollama(
-                gemini_error=e,
-                notice_message="Gemini grounded search returned 503. Fell back to Ollama web search.",
-                fallback_unavailable_notice=(
-                    "Gemini grounded search returned 503, and Ollama web-search fallback was unavailable. "
-                    "Check Gemini availability and OLLAMA_API_KEY."
-                ),
-                fallback_error_prefix="Gemini grounded search returned 503",
-            )
         except Exception as e:
-            logger.warning("Grounded search failed for question %r: %s", question, e)
+            logger.warning("Tavily search failed for question %r: %s", question, e)
             search_response = fallback_to_ollama(
-                gemini_error=e,
-                notice_message="Gemini grounded search failed. Fell back to Ollama web search.",
+                search_error=e,
+                notice_message="Tavily search failed. Fell back to Ollama web search.",
                 fallback_unavailable_notice=(
-                    "Gemini grounded search failed, and Ollama web-search fallback was unavailable. "
-                    "Check Gemini availability and OLLAMA_API_KEY."
+                    "Tavily search failed, and Ollama web-search fallback was unavailable. "
+                    "Add OLLAMA_API_KEY or check TAVILY_API_KEY."
                 ),
-                fallback_error_prefix="Grounded search failed",
+                fallback_error_prefix="Tavily search failed",
             )
 
-    if search_response.get("summary"):
-        grounded_summaries.append(
+    search_summaries = search_response.get("summaries", []) or []
+    if not search_summaries and search_response.get("summary"):
+        search_summaries = [
             {
-                "summary": search_response["summary"],
-                "executed_queries": search_response.get("executed_queries", []),
-                "label": retrieval_label,
+                "query": "Combined fallback search",
+                "purpose": "fallback retrieval",
+                "topic": "",
+                "summary": truncate_text(normalize_whitespace(search_response.get("summary", "")), FETCH_CONTENT_LIMIT),
             }
-        )
-
-    raw_results = search_response.get("results", []) or []
-    for rank, result in enumerate(raw_results, start=1):
-        title = normalize_whitespace(result.get("title", ""))
-        url = normalize_whitespace(result.get("url", ""))
-
-        if not url:
-            continue
-
-        candidate = {
-            "query_index": 0,
-            "query_text": "Grounded search",
-            "purpose": "combined search plan",
-            "rank_within_query": rank,
-            "title": title or "Untitled result",
-            "url": url,
-            "source": domain_from_url(url),
-            "snippet": truncate_text(
-                search_response.get("summary", ""),
-                SEARCH_SNIPPET_LIMIT,
-            ),
-        }
-
-        if url not in deduped_by_url and len(all_candidates) < TOTAL_CANDIDATE_LIMIT:
-            deduped_by_url[url] = candidate
-            all_candidates.append(candidate)
+        ]
+    all_candidates = search_response.get("results", []) or []
+    search_errors = search_response.get("errors", []) or []
+    credits_used = float(search_response.get("credits_used", 0.0) or 0.0)
 
     lines = []
     lines.append("SEARCH OBJECTIVE")
@@ -1033,32 +995,33 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
     lines.append("CANDIDATE RESULT POOL")
     if all_candidates:
         for idx, item in enumerate(all_candidates, start=1):
+            source = item.get("source") or domain_from_url(item.get("url", ""))
             lines.append(
-                f"[{idx:02d}] Source={item['source']} | Title={item['title']}"
+                f"[{idx:02d}] Source={source} | Title={item.get('title', 'Untitled result')}"
             )
-            lines.append(f"URL: {item['url']}")
-            if item["snippet"]:
+            lines.append(f"URL: {item.get('url', '')}")
+            if item.get("snippet"):
                 lines.append(f"Snippet: {item['snippet']}")
             lines.append("")
     else:
         lines.append("- No search results collected.")
         lines.append("")
 
-    lines.append("GROUNDED QUERY SUMMARIES")
-    if grounded_summaries:
-        for idx, item in enumerate(grounded_summaries, start=1):
-            lines.append(f"[{idx:02d}] {item['label']}")
-            if item["executed_queries"]:
-                lines.append(f"Google queries: {', '.join(item['executed_queries'])}")
+    lines.append("SEARCH QUERY SUMMARIES")
+    if search_summaries:
+        for idx, item in enumerate(search_summaries, start=1):
+            lines.append(f"[{idx:02d}] {retrieval_label}")
+            lines.append(f"Query: {item.get('query', '')}")
+            lines.append(f"Purpose: {item.get('purpose', '')}")
+            if item.get("topic"):
+                lines.append(f"Topic: {item.get('topic', '')}")
             lines.append(f"Summary: {item['summary']}")
             lines.append("")
     else:
-        lines.append("- No grounded summaries collected.")
+        lines.append("- No query summaries collected.")
         lines.append("")
 
-    executed_queries = []
-    for item in grounded_summaries:
-        executed_queries.extend(item.get("executed_queries", []))
+    executed_queries = search_response.get("executed_queries", []) or []
 
     unique_executed_queries = []
     seen_executed_queries = set()
@@ -1082,6 +1045,7 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
         "unique_executed_query_count": len(unique_executed_queries),
         "executed_queries": unique_executed_queries,
         "candidate_count": len(all_candidates),
+        "credits_used": credits_used,
     }
 
     return {
@@ -1107,6 +1071,10 @@ def format_search_metrics_notice(metrics: dict) -> str:
         ),
         f"Candidate results kept: {metrics.get('candidate_count', 0)}",
     ]
+
+    credits_used = metrics.get("credits_used")
+    if credits_used is not None:
+        lines.append(f"Tavily credits used: {float(credits_used):.2f}")
 
     if executed_queries:
         lines.append("Executed search queries:")
@@ -1388,49 +1356,6 @@ def split_text_by_lines(text: str, max_len: int):
     return chunks
 
 
-def is_list_item_line(line: str) -> bool:
-    return bool(re.match(r"^([-*•]|\d+\.)\s", line))
-
-
-def should_preserve_text_line(line: str) -> bool:
-    return (
-        is_list_item_line(line)
-        or line.startswith("> ")
-        or line.startswith("#")
-    )
-
-
-def reflow_text_segment(text: str) -> str:
-    output_lines = []
-    paragraph_parts = []
-
-    def flush_paragraph():
-        if paragraph_parts:
-            output_lines.append(" ".join(paragraph_parts))
-            paragraph_parts.clear()
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-
-        if not line:
-            flush_paragraph()
-            if output_lines and output_lines[-1] != "":
-                output_lines.append("")
-            continue
-
-        if should_preserve_text_line(line):
-            flush_paragraph()
-            output_lines.append(line)
-            continue
-
-        paragraph_parts.append(line)
-
-    flush_paragraph()
-
-    while output_lines and output_lines[-1] == "":
-        output_lines.pop()
-
-    return "\n".join(output_lines)
 
 
 def render_text_chunk_as_html(text: str) -> str:
@@ -1579,7 +1504,7 @@ async def run_search_plan_step(status_message, stage_state: dict, question: str,
 
 
 async def run_search_pool_step(status_message, stage_state: dict, question: str, recent_chat_context: str, plan: dict, timeout_seconds: int):
-    stage_state["detail"] = "Running grounded web searches and collecting cited sources."
+    stage_state["detail"] = "Running Tavily web searches and collecting cited sources."
     await set_stage(status_message, stage_state, "search_pool")
 
     try:
@@ -1677,7 +1602,7 @@ async def prepare_shared_pool(
                 + "\n".join(f"- {q['query']}" for q in plan.get("queries", []))
                 + "\n\nCANDIDATE RESULT POOL\n"
                 f"- Search pool generation failed: {pool_error}\n\n"
-                "GROUNDED QUERY SUMMARIES\n"
+                "SEARCH QUERY SUMMARIES\n"
                 "- None"
             )
             notices = []
@@ -1863,6 +1788,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "Status: bot is running.\n"
         f"Search planner model: {SEARCH_PLANNER_MODEL}\n"
         f"Search retrieval model: {SEARCH_RETRIEVAL_MODEL}\n"
+        f"Tavily search depth: {TAVILY_SEARCH_DEPTH}\n"
         f"Local model 1: {LOCAL_MODEL_1}\n"
         f"Local model 2: {LOCAL_MODEL_2}\n"
         f"Cloud model: {CLOUD_MODEL}\n"
