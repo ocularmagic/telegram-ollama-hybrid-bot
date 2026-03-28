@@ -1,3 +1,4 @@
 python-telegram-bot>=22.0
 ollama>=0.6.0
 python-dotenv>=1.0.1
+exa-py>=1.15.0
