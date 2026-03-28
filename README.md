@@ -1,28 +1,28 @@
 # Telegram Hybrid Research Bot with Ollama + Tavily
 
-A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow, with both a fast live-search mode and an optional no-search mode.
+A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow, with both a full live-search mode and a default no-search mode.
 
 This repo is for builders who want to learn how a hybrid local + cloud system behaves in the real world, not just how to call one model once.
 
 ## What it does
 
-When a user runs `/ask ...`, the bot:
+When a user runs `/asksearch ...`, the bot:
 
-1. Uses a **built-in planner** to generate multiple search angles.
-2. Uses **Tavily live web search** to collect a broad shared candidate pool.
+1. Uses a **local planner model** to generate multiple search angles.
+2. Uses **Exa or Tavily live web search** to collect a broad shared candidate pool.
 3. Captures per-query summaries and cited web sources for extra context.
 4. Sends the same evidence pool to **two local models**.
 5. Sends the evidence pool plus both local answers to **one cloud model**.
 6. Returns a final answer with staged progress updates in Telegram.
 
-When a user runs `/asknosearch ...`, the bot skips internet retrieval and answers from model knowledge plus recent chat context only.
+When a user runs `/ask ...`, the bot skips internet retrieval and answers from model knowledge plus recent chat context only.
 
 When a user runs `/fast ...`, the bot keeps live search but skips the two local-model review steps and asks Kimi for a concise answer.
 
 By default, the repo is configured as:
 
-- **Search planner:** `built-in`
-- **Search retrieval:** `tavily-search`
+- **Search planner:** `qwen3:14b`
+- **Search retrieval:** `exa-search`
 - **Local model 1:** `qwen3:14b`
 - **Local model 2:** `gemma3:12b`
 - **Final synthesis:** `kimi-k2.5:cloud`
@@ -43,11 +43,11 @@ This is a good learning repo if you want hands-on experience with:
 ```text
 Telegram
   |
-Command-only bot (/ask, /fast, /asknosearch, /status, /clear)
+Command-only bot (/ask, /asksearch, /fast, /status, /clear)
   |
-Built-in search planner
+Local search planner model
   |
-Tavily live web search
+Exa or Tavily live web search
   |
 Broad shared evidence pool
   |            |
@@ -65,7 +65,7 @@ Final synthesis
 - Python 3.11+
 - Ollama installed locally
 - A Telegram bot token from BotFather
-- A Tavily API key
+- An Exa API key or Tavily API key
 - Enough local hardware to run your chosen local models
 
 If you keep the default final model as `kimi-k2.5:cloud`, sign in locally with:
@@ -113,13 +113,15 @@ Minimum required variables:
 
 - `TELEGRAM_BOT_TOKEN`
 - `BOT_USERNAME`
-- `TAVILY_API_KEY`
+- at least one of `EXA_API_KEY` or `TAVILY_API_KEY`
 
 The bot now loads `.env` automatically at startup.
 
-Optional variable:
+Optional variables:
 
 - `OLLAMA_API_KEY` if you want Ollama web-search fallback when Tavily is unavailable
+- `EXA_API_KEY` if you want Exa as the primary retrieval provider
+- `TAVILY_API_KEY` if you want Tavily as primary or as fallback behind Exa
 
 ### 5. Pull the default local models once
 
@@ -153,13 +155,13 @@ Shows a short help message.
 Shows model assignments, timeout settings, search-pool limits, and memory status.
 
 ### `/ask your question`
-Runs the full hybrid workflow.
+Skips internet search and answers from model knowledge plus chat context only.
+
+### `/asksearch your question`
+Runs the full hybrid workflow with live search.
 
 ### `/fast your question`
 Runs live search, skips the local-model debate, and returns a concise answer.
-
-### `/asknosearch your question`
-Skips internet search and answers from model knowledge plus chat context only.
 
 ### `/clear`
 Clears rolling memory for the current Telegram chat.
@@ -169,9 +171,9 @@ Clears rolling memory for the current Telegram chat.
 Recommended pattern in group chats:
 
 ```text
-/ask@your_bot_username what are the top 5 news stories from the last 72 hours?
+/asksearch@your_bot_username what are the top 5 news stories from the last 72 hours?
 /fast@your_bot_username what are the hours for Pike Place Chowder today?
-/asknosearch@your_bot_username explain TCP vs UDP from general knowledge
+/ask@your_bot_username explain TCP vs UDP from general knowledge
 ```
 
 Keep Telegram **Privacy Mode ON** unless you intentionally want different bot behavior in groups.
@@ -183,10 +185,10 @@ The bot stores a short rolling history per Telegram chat so follow-up questions 
 Example:
 
 ```text
-/ask what are the top 5 market stories this week?
+/asksearch what are the top 5 market stories this week?
 /fast what time does Costco close today?
 /ask give me more detail on the gold-price story you mentioned
-/asknosearch explain the last answer without using internet search
+/ask explain the last answer without using internet search
 ```
 
 This is in-memory only. If the process restarts, memory resets.
@@ -204,7 +206,7 @@ This repo uses a **shared-evidence** design:
 
 That makes it easier to compare model behavior without introducing too many moving parts at once.
 
-If you intentionally want to bypass that retrieval layer, use `/asknosearch`.
+If you intentionally want to bypass that retrieval layer, use `/ask`.
 If you want live data without the full multi-model analysis, use `/fast`.
 
 ### Search breadth is configurable
@@ -214,6 +216,7 @@ Useful knobs in `bot.py`:
 - `SEARCH_QUERY_LIMIT`
 - `SEARCH_RESULTS_PER_QUERY`
 - `TOTAL_CANDIDATE_LIMIT`
+- `LOCAL_CANDIDATE_LIMIT`
 - `SEARCH_SNIPPET_LIMIT`
 - `FETCH_CONTENT_LIMIT`
 - `SEARCH_CACHE_TTL_SECONDS`
@@ -222,14 +225,14 @@ Useful knobs in `bot.py`:
 - `TAVILY_DAILY_CREDIT_LIMIT`
 
 The bot also keeps a persistent search cache on disk. Repeated normalized searches can reuse the same retrieval result for 12 hours by default instead of spending another Tavily or web-search call.
-It also keeps daily search stats on disk so `/status` can show how many uncached Tavily searches were used today and estimate how many uncached asks remain before the configured daily credit budget.
+It also keeps daily search stats on disk so `/status` can show recent Exa/Tavily usage and estimate how many uncached Tavily asks remain before the configured daily credit budget.
 
 ### Timeouts are intentionally generous
 
 Default values:
 
 - evidence/search stage: `300s`
-- local model stage: `300s`
+- local model stage: `600s`
 - final synthesis stage: `600s`
 
 That gives hard prompts room to finish, while the heartbeat updates keep Telegram users informed.

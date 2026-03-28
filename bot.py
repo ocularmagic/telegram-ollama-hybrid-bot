@@ -12,7 +12,7 @@ import urllib.error
 from datetime import datetime, timedelta
 
 from telegram import Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from ollama import chat
 from dotenv import load_dotenv
@@ -31,23 +31,27 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "qwen3:14b")
 LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "gemma3:12b")
 CLOUD_MODEL = os.getenv("CLOUD_MODEL", "kimi-k2.5:cloud")
-SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", "built-in")
+SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", LOCAL_MODEL_1)
 SEARCH_RETRIEVAL_MODEL = os.getenv("SEARCH_RETRIEVAL_MODEL", "tavily-search")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot_username")
 TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
 TAVILY_DAILY_CREDIT_LIMIT = float(os.getenv("TAVILY_DAILY_CREDIT_LIMIT", "0"))
+EXA_SEARCH_TYPE = os.getenv("EXA_SEARCH_TYPE", "auto")
+EXA_HIGHLIGHTS_MAX_CHARS = int(os.getenv("EXA_HIGHLIGHTS_MAX_CHARS", "4000"))
 
 MAX_TELEGRAM_CHUNK = 3500
 MAX_PRE_CHUNK = 3000
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "15"))
+TAVILY_MAX_QUERY_CHARS = int(os.getenv("TAVILY_MAX_QUERY_CHARS", "400"))
 
 EVIDENCE_TIMEOUT_SECONDS = int(os.getenv("EVIDENCE_TIMEOUT_SECONDS", "300"))
-LOCAL_MODEL_TIMEOUT_SECONDS = int(os.getenv("LOCAL_MODEL_TIMEOUT_SECONDS", "300"))
+LOCAL_MODEL_TIMEOUT_SECONDS = int(os.getenv("LOCAL_MODEL_TIMEOUT_SECONDS", "600"))
 FINAL_TIMEOUT_SECONDS = int(os.getenv("FINAL_TIMEOUT_SECONDS", "600"))
 
-SEARCH_QUERY_LIMIT = int(os.getenv("SEARCH_QUERY_LIMIT", "3"))
-SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "5"))
+SEARCH_QUERY_LIMIT = int(os.getenv("SEARCH_QUERY_LIMIT", "2"))
+SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "20"))
 TOTAL_CANDIDATE_LIMIT = int(os.getenv("TOTAL_CANDIDATE_LIMIT", "40"))
+LOCAL_CANDIDATE_LIMIT = int(os.getenv("LOCAL_CANDIDATE_LIMIT", "10"))
 SEARCH_SNIPPET_LIMIT = int(os.getenv("SEARCH_SNIPPET_LIMIT", "280"))
 FETCH_CONTENT_LIMIT = int(os.getenv("FETCH_CONTENT_LIMIT", "900"))
 SEARCH_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "43200"))
@@ -60,6 +64,7 @@ MEMORY_ANSWER_CHARS = int(os.getenv("MEMORY_ANSWER_CHARS", "5000"))
 
 CHAT_MEMORY = {}
 CHAT_LOCKS = {}
+CHAT_LAST_REQUEST_TIMINGS = {}
 SEARCH_CACHE = {}
 SEARCH_CACHE_LOCK = threading.Lock()
 SEARCH_STATS = {}
@@ -159,20 +164,20 @@ Output only the user-facing answer.
 
 START_TEXT = (
     "Bot is working.\n\n"
-    "Use /ask followed by your question.\n"
+    "Use /ask for an answer without internet search.\n"
+    "Use /asksearch for a full live-search answer.\n"
     "Use /fast for a concise live-search answer.\n"
-    f"In groups, use /ask@{BOT_USERNAME} your question.\n"
-    "Use /asknosearch to answer without internet search.\n"
+    f"In groups, use /ask@{BOT_USERNAME} or /asksearch@{BOT_USERNAME}.\n"
     "Use /clear to clear this chat's rolling memory."
 )
 
 ASK_USAGE = (
     "Usage:\n"
     "/ask your question here\n"
-    "/asknosearch your question here\n\n"
+    "/asksearch your question here\n\n"
     "Example:\n"
-    "/ask what are the top 5 news headlines from the last 72 hours?\n"
-    "/asknosearch explain TLS handshakes from general knowledge"
+    "/ask explain TLS handshakes from general knowledge\n"
+    "/asksearch what are the top 5 news headlines from the last 72 hours?"
 )
 
 FAST_USAGE = (
@@ -187,9 +192,97 @@ class TavilySearchError(RuntimeError):
     pass
 
 
+class ExaSearchError(RuntimeError):
+    pass
+
+
 def truncate_text(text: str, max_len: int) -> str:
     text = text or ""
     return text if len(text) <= max_len else text[:max_len]
+
+
+def get_object_field(obj, name: str, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+QUERY_STOPWORDS = {
+    "a", "an", "and", "any", "are", "as", "at", "be", "been", "being", "but", "by",
+    "can", "could", "do", "does", "for", "from", "get", "give", "had", "has", "have",
+    "help", "here", "how", "i", "if", "in", "into", "is", "it", "its", "just", "let",
+    "like", "make", "me", "might", "my", "need", "not", "of", "on", "or", "our", "so",
+    "take", "that", "the", "their", "them", "there", "these", "this", "those", "to",
+    "too", "was", "we", "welcome", "what", "when", "where", "which", "while", "who",
+    "will", "with", "would", "you", "your",
+}
+
+QUERY_FILLER_PATTERNS = [
+    r"^you are\b",
+    r"^i am\b",
+    r"\bgive me\b",
+    r"\btake your time\b",
+    r"\bas lengthy an answer as necessary\b",
+    r"\bif i am missing anything\b",
+    r"\bmake me aware\b",
+    r"\bbe objective\b",
+    r"\bbe informative\b",
+    r"\bi welcome\b",
+]
+
+QUERY_INTENT_PATTERNS = [
+    (r"\bwhich states?\b", "which states"),
+    (r"\bwhich countries?\b", "which countries"),
+    (r"\bwhich cities?\b", "which cities"),
+    (r"\bwhich counties?\b", "which counties"),
+    (r"\bwhich companies?\b", "which companies"),
+    (r"\bwhich models?\b", "which models"),
+    (r"\bonly state\b", "only state"),
+    (r"\bonly states\b", "only states"),
+    (r"\bonly country\b", "only country"),
+    (r"\bonly countries\b", "only countries"),
+    (r"\bonly city\b", "only city"),
+    (r"\bonly cities\b", "only cities"),
+    (r"\bonly company\b", "only company"),
+    (r"\bonly companies\b", "only companies"),
+    (r"\bonly model\b", "only model"),
+    (r"\bonly models\b", "only models"),
+    (r"\bdifference between\b", "difference between"),
+    (r"\bcompare\b", "compare"),
+    (r"\bcomparison\b", "comparison"),
+    (r"\bversus\b", "versus"),
+    (r"\bvs\.?\b", "vs"),
+    (r"\bunique\b", "unique"),
+    (r"\bexclusive\b", "exclusive"),
+]
+
+
+SEARCH_PLANNER_SYSTEM_PROMPT = """You create compact web search plans for a retrieval pipeline.
+
+Return JSON only with this exact schema:
+{
+  "search_objective": "short sentence",
+  "queries": [
+    {"query": "compact web query", "purpose": "why this angle helps"}
+  ]
+}
+
+Rules:
+- Produce at most 2 queries.
+- Use exactly 1 query for simple questions.
+- Use 2 queries only when the question is genuinely complex, multi-constraint, or benefits from a second angle.
+- Each query must be a short search-engine query, not a sentence addressed to an assistant.
+- Keep each query under 400 characters.
+- Focus on high-signal nouns, places, product names, dates, and constraints.
+- Preserve the user's logical operators and comparison scope when they matter, especially words or phrases like "only", "unique", "which states", "difference between", "compare", "versus", and "vs".
+- Remove filler such as "take your time", "be objective", "give me", or role-play framing.
+- Vary the angles when useful: direct answer, official/primary sources, current/fresh status, comparison/background.
+- If the user asks for current or recent information, include a freshness-oriented query.
+- If the question is already simple, keep the queries simple.
+- Do not include Markdown or explanation outside the JSON.
+"""
 
 
 def normalize_whitespace(text: str) -> str:
@@ -198,6 +291,206 @@ def normalize_whitespace(text: str) -> str:
 
 def normalize_query_for_cache(query: str) -> str:
     return normalize_whitespace((query or "").lower())
+
+
+def split_into_query_clauses(text: str) -> list[str]:
+    raw_parts = re.split(r"(?<=[.!?])\s+|[\n;]+", text or "")
+    clauses = []
+    for part in raw_parts:
+        cleaned = normalize_whitespace(part)
+        if cleaned:
+            clauses.append(cleaned)
+    return clauses
+
+
+def is_query_filler_clause(clause: str) -> bool:
+    lowered = normalize_query_for_cache(clause)
+    return any(re.search(pattern, lowered) for pattern in QUERY_FILLER_PATTERNS)
+
+
+def extract_query_intent_phrases(text: str) -> list[str]:
+    lowered = normalize_query_for_cache(text)
+    phrases = []
+    seen = set()
+
+    for pattern, phrase in QUERY_INTENT_PATTERNS:
+        if re.search(pattern, lowered) and phrase not in seen:
+            phrases.append(phrase)
+            seen.add(phrase)
+
+    return phrases
+
+
+def question_has_comparison_or_exclusivity(text: str) -> bool:
+    return bool(extract_query_intent_phrases(text))
+
+
+def compress_clause_to_keywords(clause: str, max_terms: int = 10) -> str:
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9'./+-]*", clause or "")
+    kept = []
+    seen = set()
+
+    for token in tokens:
+        normalized = token.strip(".,:;!?()[]{}\"'")
+        lowered = normalized.lower()
+        if not normalized or lowered in QUERY_STOPWORDS:
+            continue
+        if len(lowered) <= 2 and not re.fullmatch(r"(ca|uk|us|eu|\d+)", lowered):
+            continue
+        if lowered in seen:
+            continue
+        kept.append(normalized)
+        seen.add(lowered)
+        if len(kept) >= max_terms:
+            break
+
+    return " ".join(kept)
+
+
+def compact_search_query(text: str, max_len: int) -> str:
+    cleaned = normalize_whitespace(text)
+    if len(cleaned) <= max_len:
+        return cleaned
+
+    clauses = [clause for clause in split_into_query_clauses(cleaned) if not is_query_filler_clause(clause)]
+    if not clauses:
+        clauses = split_into_query_clauses(cleaned)
+
+    joined = "; ".join(clauses)
+    if joined and len(joined) <= max_len:
+        return joined
+
+    compressed_clauses = []
+    for clause in clauses:
+        compressed = compress_clause_to_keywords(clause)
+        if compressed:
+            compressed_clauses.append(compressed)
+
+    compacted = "; ".join(compressed_clauses)
+    if compacted:
+        if len(compacted) <= max_len:
+            return compacted
+        compacted = compacted[:max_len].rstrip(" ,;")
+        if compacted:
+            return compacted
+
+    return truncate_text(cleaned, max_len).rstrip(" ,;")
+
+
+def reinforce_query_with_question_intent(question: str, query: str, max_len: int) -> str:
+    compacted_query = compact_search_query(query, max_len)
+    intent_phrases = extract_query_intent_phrases(question)
+    if not intent_phrases:
+        return compacted_query
+
+    lowered_query = normalize_query_for_cache(compacted_query)
+    missing_phrases = [phrase for phrase in intent_phrases if phrase not in lowered_query]
+    if not missing_phrases:
+        return compacted_query
+
+    prioritized_prefixes = [phrase for phrase in missing_phrases if phrase.startswith("which ")]
+    prioritized_suffixes = [phrase for phrase in missing_phrases if phrase not in prioritized_prefixes]
+
+    combined = normalize_whitespace(
+        " ".join(prioritized_prefixes[:1] + [compacted_query] + prioritized_suffixes[:2])
+    )
+    if len(combined) <= max_len:
+        return combined
+
+    allowed_query_len = max(1, max_len - len(" ".join(prioritized_prefixes[:1] + prioritized_suffixes[:2])) - 2)
+    shortened_query = compact_search_query(compacted_query, allowed_query_len)
+    return normalize_whitespace(
+        " ".join(prioritized_prefixes[:1] + [shortened_query] + prioritized_suffixes[:2])
+    )[:max_len].rstrip(" ,;")
+
+
+def derive_comparison_followup_query(question: str, base_query: str, max_len: int) -> str | None:
+    normalized_question = normalize_whitespace(question).rstrip(" ?")
+
+    require_match = re.match(
+        r"^is\s+.+?\bthe only\s+(state|country|city|county|company|model)\s+that\s+requires\s+(.+)$",
+        normalized_question,
+        flags=re.IGNORECASE,
+    )
+    if require_match:
+        group = require_match.group(1).lower()
+        target = normalize_whitespace(require_match.group(2))
+        plural_group = f"{group}s" if not group.endswith("y") else f"{group[:-1]}ies"
+        return compact_search_query(f"which {plural_group} require {target}", max_len)
+
+    has_match = re.match(
+        r"^is\s+.+?\bthe only\s+(state|country|city|county|company|model)\s+that\s+has\s+(.+)$",
+        normalized_question,
+        flags=re.IGNORECASE,
+    )
+    if has_match:
+        group = has_match.group(1).lower()
+        target = normalize_whitespace(has_match.group(2))
+        plural_group = f"{group}s" if not group.endswith("y") else f"{group[:-1]}ies"
+        return compact_search_query(f"which {plural_group} have {target}", max_len)
+
+    with_match = re.match(
+        r"^is\s+.+?\bthe only\s+(state|country|city|county|company|model)\s+with\s+(.+)$",
+        normalized_question,
+        flags=re.IGNORECASE,
+    )
+    if with_match:
+        group = with_match.group(1).lower()
+        target = normalize_whitespace(with_match.group(2))
+        plural_group = f"{group}s" if not group.endswith("y") else f"{group[:-1]}ies"
+        return compact_search_query(f"which {plural_group} have {target}", max_len)
+
+    if any(phrase.startswith("which ") for phrase in extract_query_intent_phrases(question)):
+        return reinforce_query_with_question_intent(question, base_query, max_len)
+
+    return None
+
+
+def append_query_terms(base_query: str, suffix: str, max_len: int) -> str:
+    base = compact_search_query(base_query, max_len)
+    suffix = normalize_whitespace(suffix)
+    if not suffix:
+        return base
+
+    combined = normalize_whitespace(f"{base} {suffix}")
+    if len(combined) <= max_len:
+        return combined
+
+    allowed_base_len = max(1, max_len - len(suffix) - 1)
+    shortened_base = compact_search_query(base, allowed_base_len)
+    return normalize_whitespace(f"{shortened_base} {suffix}")[:max_len].rstrip(" ,;")
+
+
+def search_query_budget(question: str) -> int:
+    text = normalize_whitespace(question)
+    if not text:
+        return 1
+
+    if question_has_comparison_or_exclusivity(question):
+        return max(1, min(SEARCH_QUERY_LIMIT, 2))
+
+    lowered = normalize_query_for_cache(text)
+    complexity_score = 0
+
+    if len(text) >= 140:
+        complexity_score += 1
+    if text.count(",") >= 2 or "\n" in text or ";" in text or "(" in text:
+        complexity_score += 1
+    if len(re.findall(r"\b(and|or|with|including|requires?|must|compare|versus|vs\.?|options?|cost|budget|fees)\b", lowered)) >= 2:
+        complexity_score += 1
+    if any(token in lowered for token in ["best", "top", "list", "compare", "recommend", "pros and cons", "tradeoff"]):
+        complexity_score += 1
+    recommended_budget = 2 if complexity_score >= 2 else 1
+    return max(1, min(SEARCH_QUERY_LIMIT, recommended_budget))
+
+
+def choose_secondary_query_suffix(question: str) -> str:
+    lowered = normalize_query_for_cache(question)
+    if is_freshness_sensitive_query(question):
+        return "latest OR current OR recent"
+    if any(term in lowered for term in ["official", "documentation", "docs", "api", "policy", "rules", "law", "regulation"]):
+        return "official documentation OR official site"
+    return "comparison OR overview OR analysis"
 
 
 def format_absolute_date(dt: datetime) -> str:
@@ -373,6 +666,9 @@ def default_daily_search_stats() -> dict:
         "tavily_uncached_asks": 0,
         "tavily_executed_queries": 0,
         "tavily_credits_used": 0.0,
+        "exa_uncached_asks": 0,
+        "exa_executed_queries": 0,
+        "exa_estimated_cost_usd": 0.0,
         "cache_hit_asks": 0,
         "fallback_asks": 0,
     }
@@ -399,6 +695,15 @@ def record_search_metrics(metrics: dict) -> None:
 
         if retrieval_mode == "Ollama web search fallback":
             entry["fallback_asks"] = int(entry.get("fallback_asks", 0)) + 1
+
+        if retrieval_mode == "Exa search" and not cache_hit:
+            entry["exa_uncached_asks"] = int(entry.get("exa_uncached_asks", 0)) + 1
+            entry["exa_executed_queries"] = int(entry.get("exa_executed_queries", 0)) + int(
+                metrics.get("executed_query_count", 0)
+            )
+            entry["exa_estimated_cost_usd"] = float(entry.get("exa_estimated_cost_usd", 0.0)) + float(
+                metrics.get("cost_estimate_usd", 0.0)
+            )
 
         if retrieval_mode == "Tavily search" and not cache_hit:
             entry["tavily_uncached_asks"] = int(entry.get("tavily_uncached_asks", 0)) + 1
@@ -428,6 +733,9 @@ def format_today_search_stats() -> str:
     tavily_uncached_asks = int(stats.get("tavily_uncached_asks", 0))
     tavily_executed_queries = int(stats.get("tavily_executed_queries", 0))
     tavily_credits_used = float(stats.get("tavily_credits_used", 0.0))
+    exa_uncached_asks = int(stats.get("exa_uncached_asks", 0))
+    exa_executed_queries = int(stats.get("exa_executed_queries", 0))
+    exa_estimated_cost_usd = float(stats.get("exa_estimated_cost_usd", 0.0))
     cache_hit_asks = int(stats.get("cache_hit_asks", 0))
     fallback_asks = int(stats.get("fallback_asks", 0))
     remaining_tavily_credits = max(0.0, TAVILY_DAILY_CREDIT_LIMIT - tavily_credits_used)
@@ -457,6 +765,9 @@ def format_today_search_stats() -> str:
     return (
         f"Daily search stats ({today_key()})\n"
         f"Total asks today: {ask_count}\n"
+        f"Exa uncached asks today: {exa_uncached_asks}\n"
+        f"Exa executed queries today: {exa_executed_queries}\n"
+        f"Exa estimated cost today: ${exa_estimated_cost_usd:.4f}\n"
         f"Tavily uncached asks today: {tavily_uncached_asks}\n"
         f"Tavily executed queries today: {tavily_executed_queries}\n"
         f"{budget_line}\n"
@@ -504,16 +815,88 @@ def extract_json_object(text: str):
     raise ValueError("Could not parse JSON from planner response.")
 
 
+def normalize_search_plan(plan: dict, question: str) -> dict:
+    default_plan = default_search_plan(question)
+    query_budget = search_query_budget(question)
+    queries = []
+    seen_queries = set()
+
+    for item in (plan or {}).get("queries", []):
+        raw_query = item.get("query", "") if isinstance(item, dict) else ""
+        raw_purpose = item.get("purpose", "") if isinstance(item, dict) else ""
+        query = reinforce_query_with_question_intent(question, raw_query, TAVILY_MAX_QUERY_CHARS)
+        purpose = normalize_whitespace(raw_purpose) or "general angle"
+        cache_key = normalize_query_for_cache(query)
+        if not query or not cache_key or cache_key in seen_queries:
+            continue
+        seen_queries.add(cache_key)
+        queries.append({"query": query, "purpose": purpose})
+        if len(queries) >= query_budget:
+            break
+
+    if not queries:
+        queries = default_plan.get("queries", [])[:query_budget]
+
+    return {
+        "search_objective": normalize_whitespace((plan or {}).get("search_objective", "")) or default_plan["search_objective"],
+        "queries": queries,
+    }
+
+
 def default_search_plan(question: str) -> dict:
+    base_query = reinforce_query_with_question_intent(
+        question,
+        question,
+        max(80, TAVILY_MAX_QUERY_CHARS - 64),
+    )
+    query_budget = search_query_budget(question)
+    queries = [{"query": base_query, "purpose": "direct query"}]
+
+    if query_budget >= 2:
+        secondary_query = derive_comparison_followup_query(question, base_query, TAVILY_MAX_QUERY_CHARS)
+        if not secondary_query:
+            secondary_query = append_query_terms(
+                base_query,
+                choose_secondary_query_suffix(question),
+                TAVILY_MAX_QUERY_CHARS,
+            )
+        queries.append(
+            {
+                "query": secondary_query,
+                "purpose": "secondary angle",
+            }
+        )
+
     return {
         "search_objective": "Build a broad, multi-angle search pool for the user question.",
-        "queries": [
-            {"query": question, "purpose": "direct query"},
-            {"query": f"{question} official documentation OR official site", "purpose": "official/primary sources"},
-            {"query": f"{question} latest OR current OR recent", "purpose": "freshness/current status"},
-            {"query": f"{question} comparison OR overview OR analysis", "purpose": "broader explanatory angle"},
-        ],
+        "queries": queries,
     }
+
+
+def build_search_planner_prompt(question: str, recent_chat_context: str) -> str:
+    current_date_context = build_current_date_context()
+    return (
+        "Create a compact web search plan for this user request.\n\n"
+        f"{current_date_context}\n\n"
+        "RECENT CHAT CONTEXT\n"
+        f"{recent_chat_context or 'None'}\n\n"
+        "CURRENT USER QUESTION\n"
+        f"{question}\n\n"
+        "Return JSON only."
+    )
+
+
+def generate_search_plan_with_model(question: str, recent_chat_context: str, planner_model: str) -> dict:
+    planner_prompt = build_search_planner_prompt(question, recent_chat_context)
+    planner_response = call_ollama_model(
+        planner_model,
+        planner_prompt,
+        SEARCH_PLANNER_SYSTEM_PROMPT,
+    )
+    parsed_plan = extract_json_object(planner_response)
+    if not isinstance(parsed_plan, dict):
+        raise ValueError("Planner response was not a JSON object.")
+    return normalize_search_plan(parsed_plan, question)
 
 
 def build_no_search_pool(question: str, recent_chat_context: str) -> dict:
@@ -589,6 +972,19 @@ def tavily_api_post(path: str, payload: dict) -> dict:
         raise TavilySearchError(f"Tavily API HTTP {e.code}: {body}")
     except urllib.error.URLError as e:
         raise TavilySearchError(f"Tavily API connection error: {e}")
+
+
+def get_exa_client():
+    api_key = os.getenv("EXA_API_KEY")
+    if not api_key:
+        raise ExaSearchError("EXA_API_KEY is not set.")
+
+    try:
+        from exa_py import Exa
+    except ImportError as e:
+        raise ExaSearchError("exa-py is not installed. Run `pip install exa-py`.") from e
+
+    return Exa(api_key=api_key)
 
 
 def ollama_api_post(path: str, payload: dict) -> dict:
@@ -675,6 +1071,7 @@ def save_chat_turn(chat_id: int, question: str, final_answer: str) -> None:
 def clear_chat_history(chat_id: int) -> None:
     CHAT_MEMORY.pop(chat_id, None)
     CHAT_LOCKS.pop(chat_id, None)
+    CHAT_LAST_REQUEST_TIMINGS.pop(chat_id, None)
 
 
 def format_recent_chat_context(chat_id: int) -> str:
@@ -693,26 +1090,44 @@ def format_recent_chat_context(chat_id: int) -> str:
     return "\n".join(lines).strip()
 
 
-def generate_search_plan(question: str, recent_chat_context: str) -> dict:
-    _ = recent_chat_context
-    plan = default_search_plan(question)
-    cleaned_queries = []
-
-    for item in plan.get("queries", []):
-        query = normalize_whitespace(item.get("query", ""))
-        purpose = normalize_whitespace(item.get("purpose", ""))
-        if query:
-            cleaned_queries.append(
-                {
-                    "query": query,
-                    "purpose": purpose or "general angle",
-                }
-            )
-
-    return {
-        "search_objective": normalize_whitespace(plan.get("search_objective", "")) or "Build a broad, multi-angle search pool.",
-        "queries": cleaned_queries[:SEARCH_QUERY_LIMIT],
+def save_last_request_timing(chat_id: int, mode: str, total_elapsed: float, stage_state: dict) -> None:
+    CHAT_LAST_REQUEST_TIMINGS[chat_id] = {
+        "mode": mode,
+        "total_elapsed": max(0.0, float(total_elapsed)),
+        "stage_summary": format_stage_timing_summary(stage_state),
+        "prompt_summary": format_prompt_metrics_summary(stage_state),
+        "recorded_at": int(time.time()),
     }
+
+
+def format_last_request_timing(chat_id: int) -> str:
+    timing = CHAT_LAST_REQUEST_TIMINGS.get(chat_id)
+    if not isinstance(timing, dict):
+        return "Most recent request timing: none yet."
+
+    mode = timing.get("mode", "unknown")
+    total_elapsed = float(timing.get("total_elapsed", 0.0))
+    stage_summary = timing.get("stage_summary", "no stage timings recorded")
+    prompt_summary = timing.get("prompt_summary", "no prompt metrics recorded")
+    recorded_at = int(timing.get("recorded_at", 0))
+    recorded_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(recorded_at)) if recorded_at else "unknown"
+
+    return (
+        "Most recent request timing\n"
+        f"Mode: {mode}\n"
+        f"Total elapsed: {total_elapsed:.2f}s\n"
+        f"Stages: {stage_summary}\n"
+        f"Prompts: {prompt_summary}\n"
+        f"Recorded at: {recorded_text}"
+    )
+
+
+def generate_search_plan(question: str, recent_chat_context: str) -> dict:
+    planner_model = normalize_whitespace(SEARCH_PLANNER_MODEL)
+    if not planner_model or planner_model.lower() == "built-in":
+        return normalize_search_plan(default_search_plan(question), question)
+
+    return generate_search_plan_with_model(question, recent_chat_context, planner_model)
 
 
 def is_freshness_sensitive_query(text: str) -> bool:
@@ -738,8 +1153,120 @@ def infer_tavily_topic(question: str, query: str) -> str:
     return "news" if is_freshness_sensitive_query(question) or is_freshness_sensitive_query(query) else "general"
 
 
+def infer_exa_category(question: str, query: str) -> str | None:
+    combined = normalize_query_for_cache(f"{question} {query}")
+    if any(term in combined for term in ["news", "headline", "breaking", "today", "latest", "current", "recent"]):
+        return "news"
+    if any(term in combined for term in ["paper", "research", "study", "arxiv", "publication", "journal"]):
+        return "research paper"
+    return None
+
+
+def exa_search_pool(question: str, recent_chat_context: str, plan: dict) -> dict:
+    _ = recent_chat_context
+    exa = get_exa_client()
+
+    all_candidates = []
+    deduped_by_url = {}
+    search_errors = []
+    executed_queries = []
+    query_summaries = []
+    cost_estimate_usd = 0.0
+
+    for idx, query_item in enumerate(plan.get("queries", [])[:SEARCH_QUERY_LIMIT], start=1):
+        query_text = compact_search_query(query_item.get("query", ""), TAVILY_MAX_QUERY_CHARS)
+        purpose = normalize_whitespace(query_item.get("purpose", "")) or "general angle"
+        if not query_text:
+            continue
+
+        executed_queries.append(query_text)
+        payload = {
+            "query": query_text,
+            "type": normalize_whitespace(EXA_SEARCH_TYPE) or "auto",
+            "num_results": max(1, min(SEARCH_RESULTS_PER_QUERY, 100)),
+            "contents": {
+                "highlights": {
+                    "max_characters": max(200, EXA_HIGHLIGHTS_MAX_CHARS),
+                }
+            },
+        }
+
+        category = infer_exa_category(question, query_text)
+        if category:
+            payload["category"] = category
+
+        try:
+            response = exa.search(**payload)
+        except Exception as e:
+            logger.warning("Exa search failed for %r: %s", query_text, e)
+            search_errors.append(f"Q{idx} failed: {e}")
+            continue
+
+        cost_dollars = get_object_field(response, "cost_dollars")
+        if cost_dollars is None:
+            cost_dollars = get_object_field(response, "costDollars")
+        cost_total = get_object_field(cost_dollars, "total", 0.0)
+        cost_estimate_usd += float(cost_total or 0.0)
+
+        output = get_object_field(response, "output")
+        output_content_raw = get_object_field(output, "content", "")
+        if isinstance(output_content_raw, (dict, list)):
+            output_content_raw = json.dumps(output_content_raw, ensure_ascii=True)
+        output_content = normalize_whitespace(str(output_content_raw))
+        if output_content:
+            query_summaries.append(
+                {
+                    "query": query_text,
+                    "purpose": purpose,
+                    "topic": category or "",
+                    "summary": truncate_text(output_content, FETCH_CONTENT_LIMIT),
+                }
+            )
+
+        for rank, result in enumerate(get_object_field(response, "results", []) or [], start=1):
+            title = normalize_whitespace(get_object_field(result, "title", ""))
+            url = normalize_whitespace(get_object_field(result, "url", ""))
+            highlights = get_object_field(result, "highlights", []) or []
+            highlight_text = normalize_whitespace(" ".join(normalize_whitespace(item) for item in highlights if item))
+            summary_text = normalize_whitespace(get_object_field(result, "summary", ""))
+            text_snippet = normalize_whitespace(get_object_field(result, "text", ""))
+            snippet = truncate_text(highlight_text or summary_text or text_snippet, SEARCH_SNIPPET_LIMIT)
+
+            if not url:
+                continue
+
+            candidate = {
+                "query_index": idx,
+                "query_text": query_text,
+                "purpose": purpose,
+                "rank_within_query": rank,
+                "title": title or "Untitled result",
+                "url": url,
+                "source": domain_from_url(url),
+                "snippet": snippet,
+            }
+
+            if url not in deduped_by_url and len(all_candidates) < TOTAL_CANDIDATE_LIMIT:
+                deduped_by_url[url] = candidate
+                all_candidates.append(candidate)
+
+    if executed_queries and search_errors and len(search_errors) >= len(executed_queries) and not all_candidates and not query_summaries:
+        raise ExaSearchError("; ".join(search_errors))
+
+    return {
+        "summaries": query_summaries,
+        "results": all_candidates,
+        "executed_queries": executed_queries,
+        "errors": search_errors,
+        "cost_estimate_usd": cost_estimate_usd,
+    }
+
+
 def tavily_search_pool(question: str, recent_chat_context: str, plan: dict) -> dict:
     _ = recent_chat_context
+    if not os.getenv("TAVILY_API_KEY"):
+        raise TavilySearchError("TAVILY_API_KEY is not set.")
+
     all_candidates = []
     deduped_by_url = {}
     search_errors = []
@@ -748,7 +1275,7 @@ def tavily_search_pool(question: str, recent_chat_context: str, plan: dict) -> d
     credits_used = 0.0
 
     for idx, query_item in enumerate(plan.get("queries", [])[:SEARCH_QUERY_LIMIT], start=1):
-        query_text = normalize_whitespace(query_item.get("query", ""))
+        query_text = compact_search_query(query_item.get("query", ""), TAVILY_MAX_QUERY_CHARS)
         purpose = normalize_whitespace(query_item.get("purpose", "")) or "general angle"
         if not query_text:
             continue
@@ -809,6 +1336,9 @@ def tavily_search_pool(question: str, recent_chat_context: str, plan: dict) -> d
             if url not in deduped_by_url and len(all_candidates) < TOTAL_CANDIDATE_LIMIT:
                 deduped_by_url[url] = candidate
                 all_candidates.append(candidate)
+
+    if executed_queries and search_errors and len(search_errors) >= len(executed_queries) and not all_candidates and not query_summaries:
+        raise TavilySearchError("; ".join(search_errors))
 
     return {
         "summaries": query_summaries,
@@ -893,79 +1423,21 @@ def choose_fetch_candidates(query_buckets: list, fetch_limit: int) -> list:
     return chosen
 
 
-def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict) -> dict:
+def build_search_pool_text(
+    *,
+    question: str,
+    recent_chat_context: str,
+    plan: dict,
+    retrieval_label: str,
+    current_date_context: str,
+    search_summaries: list,
+    all_candidates: list,
+    search_errors: list,
+    candidate_limit: int,
+    snippet_limit: int = SEARCH_SNIPPET_LIMIT,
+) -> str:
     queries = plan.get("queries", [])[:SEARCH_QUERY_LIMIT]
-    current_date_context = build_current_date_context()
-    notices = []
-    retrieval_label = "Tavily search"
-    cache_hit = False
-    credits_used = 0.0
-
-    def fallback_to_ollama(search_error: Exception, notice_message: str, fallback_unavailable_notice: str, fallback_error_prefix: str):
-        nonlocal retrieval_label
-        retrieval_label = "Ollama web search fallback"
-        try:
-            fallback_response = ollama_search_pool(question, plan)
-            notices.append(notice_message)
-            return fallback_response
-        except Exception as fallback_error:
-            logger.warning("Ollama fallback search failed after Tavily error: %s", fallback_error)
-            notices.append(fallback_unavailable_notice)
-            return {
-                "summaries": [],
-                "results": [],
-                "executed_queries": [],
-                "errors": [
-                    f"{fallback_error_prefix}: {search_error}",
-                    f"Fallback search failed: {fallback_error}",
-                ],
-                "credits_used": 0.0,
-            }
-
-    search_pool_cache_key = build_search_pool_cache_key(question, recent_chat_context, plan)
-    cached_search_response = get_search_cache_entry(search_pool_cache_key)
-    if cached_search_response:
-        search_response = cached_search_response
-        retrieval_label = "Tavily search (cached)"
-        cache_hit = True
-    else:
-        try:
-            search_response = tavily_search_pool(question, recent_chat_context, plan)
-            set_search_cache_entry(
-                search_pool_cache_key,
-                {
-                    "summaries": search_response.get("summaries", []) or [],
-                    "results": search_response.get("results", []) or [],
-                    "executed_queries": search_response.get("executed_queries", []) or [],
-                    "errors": search_response.get("errors", []) or [],
-                    "credits_used": search_response.get("credits_used", 0.0) or 0.0,
-                },
-            )
-        except Exception as e:
-            logger.warning("Tavily search failed for question %r: %s", question, e)
-            search_response = fallback_to_ollama(
-                search_error=e,
-                notice_message="Tavily search failed. Fell back to Ollama web search.",
-                fallback_unavailable_notice=(
-                    "Tavily search failed, and Ollama web-search fallback was unavailable. "
-                    "Add OLLAMA_API_KEY or check TAVILY_API_KEY."
-                ),
-                fallback_error_prefix="Tavily search failed",
-            )
-
-    search_summaries = search_response.get("summaries", []) or []
-    if not search_summaries and search_response.get("summary"):
-        search_summaries = [
-            {
-                "query": "Combined fallback search",
-                "purpose": "fallback retrieval",
-                "topic": "",
-                "summary": truncate_text(normalize_whitespace(search_response.get("summary", "")), FETCH_CONTENT_LIMIT),
-            }
-        ]
-    all_candidates = search_response.get("results", []) or []
-    search_errors = search_response.get("errors", []) or []
-    credits_used = float(search_response.get("credits_used", 0.0) or 0.0)
+    limited_candidates = list(all_candidates[:max(0, candidate_limit)])
 
     lines = []
     lines.append("SEARCH OBJECTIVE")
@@ -993,15 +1465,15 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
             lines.append(f"- {item}")
         lines.append("")
     lines.append("CANDIDATE RESULT POOL")
-    if all_candidates:
-        for idx, item in enumerate(all_candidates, start=1):
+    if limited_candidates:
+        for idx, item in enumerate(limited_candidates, start=1):
             source = item.get("source") or domain_from_url(item.get("url", ""))
             lines.append(
                 f"[{idx:02d}] Source={source} | Title={item.get('title', 'Untitled result')}"
             )
             lines.append(f"URL: {item.get('url', '')}")
             if item.get("snippet"):
-                lines.append(f"Snippet: {item['snippet']}")
+                lines.append(f"Snippet: {truncate_text(item['snippet'], snippet_limit)}")
             lines.append("")
     else:
         lines.append("- No search results collected.")
@@ -1021,6 +1493,154 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
         lines.append("- No query summaries collected.")
         lines.append("")
 
+    return "\n".join(lines).strip()
+
+
+def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict) -> dict:
+    current_date_context = build_current_date_context()
+    notices = []
+    configured_retrieval_model = normalize_query_for_cache(SEARCH_RETRIEVAL_MODEL)
+    retrieval_label = "Exa search" if configured_retrieval_model == "exa-search" else "Tavily search"
+    cache_hit = False
+    credits_used = 0.0
+    cost_estimate_usd = 0.0
+
+    def fallback_to_ollama(search_error: Exception, notice_message: str, fallback_unavailable_notice: str, fallback_error_prefix: str):
+        nonlocal retrieval_label
+        retrieval_label = "Ollama web search fallback"
+        try:
+            fallback_response = ollama_search_pool(question, plan)
+            notices.append(notice_message)
+            return fallback_response
+        except Exception as fallback_error:
+            logger.warning("Ollama fallback search failed after Tavily error: %s", fallback_error)
+            notices.append(fallback_unavailable_notice)
+            return {
+                "summaries": [],
+                "results": [],
+                "executed_queries": [],
+                "errors": [
+                    f"{fallback_error_prefix}: {search_error}",
+                    f"Fallback search failed: {fallback_error}",
+                ],
+                "credits_used": 0.0,
+                "cost_estimate_usd": 0.0,
+            }
+
+    def fallback_to_tavily(search_error: Exception, notice_message: str, fallback_unavailable_notice: str, fallback_error_prefix: str):
+        nonlocal retrieval_label
+        retrieval_label = "Tavily search"
+        try:
+            notices.append(notice_message)
+            return tavily_search_pool(question, recent_chat_context, plan)
+        except Exception as fallback_error:
+            logger.warning("Tavily fallback search failed after Exa error: %s", fallback_error)
+            notices.append(fallback_unavailable_notice)
+            return fallback_to_ollama(
+                search_error=search_error,
+                notice_message="Exa and Tavily search both failed. Fell back to Ollama web search.",
+                fallback_unavailable_notice=(
+                    "Exa search failed, Tavily fallback failed, and Ollama web-search fallback was unavailable. "
+                    "Check EXA_API_KEY, TAVILY_API_KEY, or OLLAMA_API_KEY."
+                ),
+                fallback_error_prefix=fallback_error_prefix,
+            )
+
+    search_pool_cache_key = build_search_pool_cache_key(question, recent_chat_context, plan)
+    cached_search_response = get_search_cache_entry(search_pool_cache_key)
+    if cached_search_response:
+        search_response = cached_search_response
+        cached_model = normalize_query_for_cache(cached_search_response.get("provider", configured_retrieval_model))
+        retrieval_label = "Exa search (cached)" if cached_model == "exa-search" else "Tavily search (cached)"
+        cache_hit = True
+    else:
+        if configured_retrieval_model == "exa-search":
+            try:
+                search_response = exa_search_pool(question, recent_chat_context, plan)
+                set_search_cache_entry(
+                    search_pool_cache_key,
+                    {
+                        "provider": "exa-search",
+                        "summaries": search_response.get("summaries", []) or [],
+                        "results": search_response.get("results", []) or [],
+                        "executed_queries": search_response.get("executed_queries", []) or [],
+                        "errors": search_response.get("errors", []) or [],
+                        "cost_estimate_usd": search_response.get("cost_estimate_usd", 0.0) or 0.0,
+                    },
+                )
+            except Exception as e:
+                logger.warning("Exa search failed for question %r: %s", question, e)
+                search_response = fallback_to_tavily(
+                    search_error=e,
+                    notice_message="Exa search failed. Fell back to Tavily web search.",
+                    fallback_unavailable_notice="Exa search failed, and Tavily fallback was unavailable. Trying Ollama web-search fallback.",
+                    fallback_error_prefix="Exa search failed",
+                )
+        else:
+            try:
+                search_response = tavily_search_pool(question, recent_chat_context, plan)
+                set_search_cache_entry(
+                    search_pool_cache_key,
+                    {
+                        "provider": "tavily-search",
+                        "summaries": search_response.get("summaries", []) or [],
+                        "results": search_response.get("results", []) or [],
+                        "executed_queries": search_response.get("executed_queries", []) or [],
+                        "errors": search_response.get("errors", []) or [],
+                        "credits_used": search_response.get("credits_used", 0.0) or 0.0,
+                    },
+                )
+            except Exception as e:
+                logger.warning("Tavily search failed for question %r: %s", question, e)
+                search_response = fallback_to_ollama(
+                    search_error=e,
+                    notice_message="Tavily search failed. Fell back to Ollama web search.",
+                    fallback_unavailable_notice=(
+                        "Tavily search failed, and Ollama web-search fallback was unavailable. "
+                        "Add OLLAMA_API_KEY or check TAVILY_API_KEY."
+                    ),
+                    fallback_error_prefix="Tavily search failed",
+                )
+
+    search_summaries = search_response.get("summaries", []) or []
+    if not search_summaries and search_response.get("summary"):
+        search_summaries = [
+            {
+                "query": "Combined fallback search",
+                "purpose": "fallback retrieval",
+                "topic": "",
+                "summary": truncate_text(normalize_whitespace(search_response.get("summary", "")), FETCH_CONTENT_LIMIT),
+            }
+        ]
+    all_candidates = search_response.get("results", []) or []
+    search_errors = search_response.get("errors", []) or []
+    credits_used = float(search_response.get("credits_used", 0.0) or 0.0)
+    cost_estimate_usd = float(search_response.get("cost_estimate_usd", 0.0) or 0.0)
+
+    pool_text = build_search_pool_text(
+        question=question,
+        recent_chat_context=recent_chat_context,
+        plan=plan,
+        retrieval_label=retrieval_label,
+        current_date_context=current_date_context,
+        search_summaries=search_summaries,
+        all_candidates=all_candidates,
+        search_errors=search_errors,
+        candidate_limit=TOTAL_CANDIDATE_LIMIT,
+    )
+    local_pool_text = build_search_pool_text(
+        question=question,
+        recent_chat_context=recent_chat_context,
+        plan=plan,
+        retrieval_label=retrieval_label,
+        current_date_context=current_date_context,
+        search_summaries=search_summaries,
+        all_candidates=all_candidates,
+        search_errors=search_errors,
+        candidate_limit=min(LOCAL_CANDIDATE_LIMIT, TOTAL_CANDIDATE_LIMIT),
+        snippet_limit=min(180, SEARCH_SNIPPET_LIMIT),
+    )
+
     executed_queries = search_response.get("executed_queries", []) or []
 
     unique_executed_queries = []
@@ -1035,10 +1655,10 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
     metrics = {
         "retrieval_mode": retrieval_label,
         "cache_hit": cache_hit,
-        "planned_query_count": len(queries),
+        "planned_query_count": len(plan.get("queries", [])[:SEARCH_QUERY_LIMIT]),
         "planned_queries": [
             normalize_whitespace(item.get("query", ""))
-            for item in queries
+            for item in plan.get("queries", [])[:SEARCH_QUERY_LIMIT]
             if normalize_whitespace(item.get("query", ""))
         ],
         "executed_query_count": len(executed_queries),
@@ -1046,10 +1666,12 @@ def build_shared_search_pool(question: str, recent_chat_context: str, plan: dict
         "executed_queries": unique_executed_queries,
         "candidate_count": len(all_candidates),
         "credits_used": credits_used,
+        "cost_estimate_usd": cost_estimate_usd,
     }
 
     return {
-        "pool_text": "\n".join(lines).strip(),
+        "pool_text": pool_text,
+        "local_pool_text": local_pool_text,
         "notices": notices,
         "metrics": metrics,
     }
@@ -1075,6 +1697,10 @@ def format_search_metrics_notice(metrics: dict) -> str:
     credits_used = metrics.get("credits_used")
     if credits_used is not None:
         lines.append(f"Tavily credits used: {float(credits_used):.2f}")
+
+    cost_estimate_usd = metrics.get("cost_estimate_usd")
+    if cost_estimate_usd is not None and float(cost_estimate_usd) > 0:
+        lines.append(f"Exa estimated cost: ${float(cost_estimate_usd):.4f}")
 
     if executed_queries:
         lines.append("Executed search queries:")
@@ -1228,6 +1854,50 @@ def format_progress_text(stage_state: dict) -> str:
     return "\n".join(lines)
 
 
+def record_stage_duration(stage_state: dict, stage_key: str, elapsed_seconds: float) -> None:
+    stage_state.setdefault("durations", {})[stage_key] = max(0.0, float(elapsed_seconds))
+
+
+def format_stage_timing_summary(stage_state: dict) -> str:
+    durations = stage_state.get("durations", {}) or {}
+    parts = []
+    for stage_key, label in PROGRESS_STAGES:
+        if stage_key in durations:
+            parts.append(f"{stage_key}={durations[stage_key]:.2f}s")
+    return ", ".join(parts) if parts else "no stage timings recorded"
+
+
+def record_prompt_metrics(stage_state: dict, key: str, text: str) -> None:
+    metrics = stage_state.setdefault("prompt_metrics", {})
+    content = text or ""
+    metrics[key] = {
+        "chars": len(content),
+        "lines": content.count("\n") + 1 if content else 0,
+    }
+
+
+def format_prompt_metrics_summary(stage_state: dict) -> str:
+    metrics = stage_state.get("prompt_metrics", {}) or {}
+    ordered_keys = [
+        "shared_pool",
+        "local_shared_pool",
+        "local_prompt",
+        "final_prompt",
+        "fast_prompt",
+        "local_answer_1",
+        "local_answer_2",
+    ]
+    parts = []
+
+    for key in ordered_keys:
+        item = metrics.get(key)
+        if not isinstance(item, dict):
+            continue
+        parts.append(f"{key}={int(item.get('chars', 0))}c/{int(item.get('lines', 0))}l")
+
+    return ", ".join(parts) if parts else "no prompt metrics recorded"
+
+
 def is_markdown_table_line(line: str) -> bool:
     stripped = line.strip()
     return stripped.startswith("|") and stripped.count("|") >= 2
@@ -1356,6 +2026,15 @@ def split_text_by_lines(text: str, max_len: int):
     return chunks
 
 
+async def reply_text_in_chunks(message, text: str, parse_mode: str | None = None, max_len: int = MAX_TELEGRAM_CHUNK) -> None:
+    normalized = (text or "").strip()
+    if not normalized:
+        return
+
+    for chunk in split_text_by_lines(normalized, max_len):
+        await message.reply_text(chunk, parse_mode=parse_mode)
+
+
 
 
 def render_text_chunk_as_html(text: str) -> str:
@@ -1443,7 +2122,7 @@ async def send_formatted_answer(update: Update, answer: str) -> None:
 
     for kind, text in segments:
         normalized_text = text if kind == "table" else reflow_text_segment(text)
-        for chunk in split_text_by_lines(normalized_text, MAX_TELEGRAM_CHUNK):
+        for chunk in split_text_by_lines(normalized_text, MAX_PRE_CHUNK):
             await update.message.reply_text(
                 render_text_chunk_as_html(chunk),
                 parse_mode="HTML",
@@ -1456,9 +2135,21 @@ async def safe_edit_status_message(status_message, text: str) -> None:
         if current_text == text:
             return
         await status_message.edit_text(text)
+    except TimedOut:
+        logger.warning("Status message edit timed out; keeping the previous progress message.")
+        return
     except BadRequest as e:
-        if "message is not modified" in str(e).lower():
+        error_text = str(e).lower()
+        if "message is not modified" in error_text:
             return
+        if "message is too long" in error_text:
+            shortened = truncate_text(text, MAX_TELEGRAM_CHUNK - 16).rstrip() + "\n\n[truncated]"
+            if shortened != text:
+                try:
+                    await status_message.edit_text(shortened)
+                    return
+                except Exception:
+                    logger.warning("Could not edit overlong status message even after truncation.")
         logger.warning("Could not edit status message: %s", e)
     except Exception:
         logger.exception("Unexpected error while editing status message.")
@@ -1490,32 +2181,52 @@ async def progress_heartbeat(status_message, stage_state: dict, stop_event: asyn
 async def run_search_plan_step(status_message, stage_state: dict, question: str, recent_chat_context: str, timeout_seconds: int):
     stage_state["detail"] = "Building multiple search angles from your question."
     await set_stage(status_message, stage_state, "planning")
+    started_at = time.monotonic()
 
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(generate_search_plan, question, recent_chat_context),
             timeout=timeout_seconds,
         )
+        elapsed = time.monotonic() - started_at
+        record_stage_duration(stage_state, "planning", elapsed)
+        logger.info("Stage timing | stage=planning elapsed=%.2fs", elapsed)
         return result, None
     except asyncio.TimeoutError:
+        elapsed = time.monotonic() - started_at
+        record_stage_duration(stage_state, "planning", elapsed)
+        logger.warning("Stage timing | stage=planning outcome=timeout elapsed=%.2fs", elapsed)
         return None, f"Search planning timed out after {timeout_seconds} seconds."
     except Exception as e:
+        elapsed = time.monotonic() - started_at
+        record_stage_duration(stage_state, "planning", elapsed)
+        logger.warning("Stage timing | stage=planning outcome=error elapsed=%.2fs error=%s", elapsed, e)
         return None, f"Search planning failed: {e}"
 
 
 async def run_search_pool_step(status_message, stage_state: dict, question: str, recent_chat_context: str, plan: dict, timeout_seconds: int):
     stage_state["detail"] = "Running Tavily web searches and collecting cited sources."
     await set_stage(status_message, stage_state, "search_pool")
+    started_at = time.monotonic()
 
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(build_shared_search_pool, question, recent_chat_context, plan),
             timeout=timeout_seconds,
         )
+        elapsed = time.monotonic() - started_at
+        record_stage_duration(stage_state, "search_pool", elapsed)
+        logger.info("Stage timing | stage=search_pool elapsed=%.2fs", elapsed)
         return result, None
     except asyncio.TimeoutError:
+        elapsed = time.monotonic() - started_at
+        record_stage_duration(stage_state, "search_pool", elapsed)
+        logger.warning("Stage timing | stage=search_pool outcome=timeout elapsed=%.2fs", elapsed)
         return {"pool_text": "", "notices": []}, f"Shared search pool step timed out after {timeout_seconds} seconds."
     except Exception as e:
+        elapsed = time.monotonic() - started_at
+        record_stage_duration(stage_state, "search_pool", elapsed)
+        logger.warning("Stage timing | stage=search_pool outcome=error elapsed=%.2fs error=%s", elapsed, e)
         return {"pool_text": "", "notices": []}, f"Shared search pool step failed: {e}"
 
 
@@ -1531,6 +2242,7 @@ async def run_ollama_step(
 ):
     stage_state["detail"] = stage_label
     await set_stage(status_message, stage_state, stage_key)
+    started_at = time.monotonic()
 
     try:
         result = await asyncio.wait_for(
@@ -1542,10 +2254,19 @@ async def run_ollama_step(
             ),
             timeout=timeout_seconds,
         )
+        elapsed = time.monotonic() - started_at
+        record_stage_duration(stage_state, stage_key, elapsed)
+        logger.info("Stage timing | stage=%s model=%s elapsed=%.2fs", stage_key, model_name, elapsed)
         return result, None
     except asyncio.TimeoutError:
+        elapsed = time.monotonic() - started_at
+        record_stage_duration(stage_state, stage_key, elapsed)
+        logger.warning("Stage timing | stage=%s model=%s outcome=timeout elapsed=%.2fs", stage_key, model_name, elapsed)
         return "", f"{stage_label} timed out after {timeout_seconds} seconds."
     except Exception as e:
+        elapsed = time.monotonic() - started_at
+        record_stage_duration(stage_state, stage_key, elapsed)
+        logger.warning("Stage timing | stage=%s model=%s outcome=error elapsed=%.2fs error=%s", stage_key, model_name, elapsed, e)
         return "", f"{stage_label} failed: {e}"
 
 
@@ -1562,6 +2283,7 @@ async def prepare_shared_pool(
         stage_state["completed_stages"].update({"planning", "search_pool"})
         search_result = build_no_search_pool(question, recent_chat_context)
         shared_pool = search_result.get("pool_text", "")
+        local_shared_pool = search_result.get("local_pool_text", shared_pool)
         notices = list(search_result.get("notices", []))
         search_metrics = search_result.get("metrics", {})
     else:
@@ -1587,6 +2309,7 @@ async def prepare_shared_pool(
             timeout_seconds=EVIDENCE_TIMEOUT_SECONDS,
         )
         shared_pool = search_result.get("pool_text", "")
+        local_shared_pool = search_result.get("local_pool_text", shared_pool)
         notices = list(search_result.get("notices", []))
         search_metrics = search_result.get("metrics", {})
 
@@ -1605,6 +2328,7 @@ async def prepare_shared_pool(
                 "SEARCH QUERY SUMMARIES\n"
                 "- None"
             )
+            local_shared_pool = shared_pool
             notices = []
             search_metrics = {
                 "retrieval_mode": "Search pool unavailable",
@@ -1632,7 +2356,7 @@ async def prepare_shared_pool(
         search_metrics.get("candidate_count", 0),
         search_metrics.get("executed_queries", []),
     )
-    return shared_pool, notices
+    return shared_pool, local_shared_pool, notices
 
 
 async def orchestrate_answer(question: str, recent_chat_context: str, status_message, force_no_search: bool = False):
@@ -1647,7 +2371,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
     heartbeat_task = asyncio.create_task(progress_heartbeat(status_message, stage_state, stop_event))
 
     try:
-        shared_pool, notices = await prepare_shared_pool(
+        shared_pool, local_shared_pool, notices = await prepare_shared_pool(
             question=question,
             recent_chat_context=recent_chat_context,
             status_message=status_message,
@@ -1655,8 +2379,17 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
             allow_no_search=True,
             force_no_search=force_no_search,
         )
+        record_prompt_metrics(stage_state, "shared_pool", shared_pool)
+        record_prompt_metrics(stage_state, "local_shared_pool", local_shared_pool)
 
-        local_prompt = build_local_prompt(question, recent_chat_context, shared_pool)
+        local_prompt = build_local_prompt(question, recent_chat_context, local_shared_pool)
+        record_prompt_metrics(stage_state, "local_prompt", local_prompt)
+        logger.info(
+            "Prompt metrics | mode=full shared_pool=%sc local_shared_pool=%sc local_prompt=%sc",
+            len(shared_pool or ""),
+            len(local_shared_pool or ""),
+            len(local_prompt or ""),
+        )
 
         local_answer_1, local_error_1 = await run_ollama_step(
             status_message=status_message,
@@ -1670,6 +2403,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         )
         if local_error_1:
             local_answer_1 = f"{LOCAL_MODEL_1} failed: {local_error_1}"
+        record_prompt_metrics(stage_state, "local_answer_1", local_answer_1)
 
         local_answer_2, local_error_2 = await run_ollama_step(
             status_message=status_message,
@@ -1683,6 +2417,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         )
         if local_error_2:
             local_answer_2 = f"{LOCAL_MODEL_2} failed: {local_error_2}"
+        record_prompt_metrics(stage_state, "local_answer_2", local_answer_2)
 
         final_prompt = build_final_prompt(
             question=question,
@@ -1690,6 +2425,13 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
             shared_pool=shared_pool,
             local_answer_1=local_answer_1,
             local_answer_2=local_answer_2,
+        )
+        record_prompt_metrics(stage_state, "final_prompt", final_prompt)
+        logger.info(
+            "Prompt metrics | mode=full final_prompt=%sc local_answer_1=%sc local_answer_2=%sc",
+            len(final_prompt or ""),
+            len(local_answer_1 or ""),
+            len(local_answer_2 or ""),
         )
 
         final_answer, final_error = await run_ollama_step(
@@ -1716,11 +2458,18 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         stage_state["detail"] = "Formatting the response for Telegram."
         await set_stage(status_message, stage_state, "sending")
         stage_state["completed_stages"].add("sending")
-        return final_answer, notices
+        return final_answer, notices, stage_state
 
     finally:
         stop_event.set()
         await heartbeat_task
+        total_elapsed = time.monotonic() - stage_state["started_at"]
+        logger.info(
+            "Request timing | mode=full total=%.2fs | %s | prompts=%s",
+            total_elapsed,
+            format_stage_timing_summary(stage_state),
+            format_prompt_metrics_summary(stage_state),
+        )
 
 
 async def orchestrate_fast_answer(question: str, recent_chat_context: str, status_message):
@@ -1735,7 +2484,7 @@ async def orchestrate_fast_answer(question: str, recent_chat_context: str, statu
     heartbeat_task = asyncio.create_task(progress_heartbeat(status_message, stage_state, stop_event))
 
     try:
-        shared_pool, notices = await prepare_shared_pool(
+        shared_pool, _local_shared_pool, notices = await prepare_shared_pool(
             question=question,
             recent_chat_context=recent_chat_context,
             status_message=status_message,
@@ -1743,8 +2492,15 @@ async def orchestrate_fast_answer(question: str, recent_chat_context: str, statu
             allow_no_search=False,
             force_no_search=False,
         )
+        record_prompt_metrics(stage_state, "shared_pool", shared_pool)
 
         fast_prompt = build_fast_prompt(question, recent_chat_context, shared_pool)
+        record_prompt_metrics(stage_state, "fast_prompt", fast_prompt)
+        logger.info(
+            "Prompt metrics | mode=fast shared_pool=%sc fast_prompt=%sc",
+            len(shared_pool or ""),
+            len(fast_prompt or ""),
+        )
         stage_state["detail"] = "Skipping local model debate for a concise fast answer."
 
         final_answer, final_error = await run_ollama_step(
@@ -1769,38 +2525,50 @@ async def orchestrate_fast_answer(question: str, recent_chat_context: str, statu
         stage_state["detail"] = "Formatting the response for Telegram."
         await set_stage(status_message, stage_state, "sending")
         stage_state["completed_stages"].add("sending")
-        return final_answer, notices
+        return final_answer, notices, stage_state
 
     finally:
         stop_event.set()
         await heartbeat_task
+        total_elapsed = time.monotonic() - stage_state["started_at"]
+        logger.info(
+            "Request timing | mode=fast total=%.2fs | %s | prompts=%s",
+            total_elapsed,
+            format_stage_timing_summary(stage_state),
+            format_prompt_metrics_summary(stage_state),
+        )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(START_TEXT)
+    await reply_text_in_chunks(update.message, START_TEXT)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     history_count = len(get_chat_history(chat_id))
+    timing_text = format_last_request_timing(chat_id)
 
-    await update.message.reply_text(
+    await reply_text_in_chunks(
+        update.message,
         "Status: bot is running.\n"
         f"Search planner model: {SEARCH_PLANNER_MODEL}\n"
         f"Search retrieval model: {SEARCH_RETRIEVAL_MODEL}\n"
         f"Tavily search depth: {TAVILY_SEARCH_DEPTH}\n"
+        f"Exa search type: {EXA_SEARCH_TYPE}\n"
         f"Local model 1: {LOCAL_MODEL_1}\n"
         f"Local model 2: {LOCAL_MODEL_2}\n"
         f"Cloud model: {CLOUD_MODEL}\n"
         f"Search query limit: {SEARCH_QUERY_LIMIT}\n"
         f"Search results per query: {SEARCH_RESULTS_PER_QUERY}\n"
         f"Total candidate limit: {TOTAL_CANDIDATE_LIMIT}\n"
+        f"Local candidate limit: {LOCAL_CANDIDATE_LIMIT}\n"
         f"Rolling memory turns kept per chat: {MAX_HISTORY_TURNS}\n"
         f"Current chat memory count: {history_count}\n"
         f"Heartbeat interval: {HEARTBEAT_SECONDS}s\n"
         f"Evidence timeout: {EVIDENCE_TIMEOUT_SECONDS}s\n"
         f"Local model timeout: {LOCAL_MODEL_TIMEOUT_SECONDS}s\n"
         f"Final timeout: {FINAL_TIMEOUT_SECONDS}s\n\n"
+        f"{timing_text}\n\n"
         f"{format_today_search_stats()}"
     )
 
@@ -1808,7 +2576,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     clear_chat_history(chat_id)
-    await update.message.reply_text("Cleared this chat's rolling memory.")
+    await reply_text_in_chunks(update.message, "Cleared this chat's rolling memory.")
 
 
 async def handle_ask_request(
@@ -1821,7 +2589,7 @@ async def handle_ask_request(
     user_text = normalize_whitespace(" ".join(context.args))
 
     if not user_text:
-        await update.message.reply_text(usage_text)
+        await reply_text_in_chunks(update.message, usage_text)
         return
 
     chat_id = update.effective_chat.id
@@ -1829,7 +2597,8 @@ async def handle_ask_request(
     chat_lock = get_chat_lock(chat_id)
 
     if chat_lock.locked():
-        await update.message.reply_text(
+        await reply_text_in_chunks(
+            update.message,
             "A previous request is still running for this chat. Wait for it to finish or use /clear after it completes."
         )
         return
@@ -1841,13 +2610,13 @@ async def handle_ask_request(
     async with chat_lock:
         try:
             if fast_mode:
-                answer, notices = await orchestrate_fast_answer(
+                answer, notices, stage_state = await orchestrate_fast_answer(
                     user_text,
                     recent_chat_context,
                     status_message,
                 )
             else:
-                answer, notices = await orchestrate_answer(
+                answer, notices, stage_state = await orchestrate_answer(
                     user_text,
                     recent_chat_context,
                     status_message,
@@ -1860,23 +2629,52 @@ async def handle_ask_request(
             await safe_edit_status_message(status_message, "Failed.")
             answer = f"Error: {e}"
             notices = []
+            stage_state = None
 
         for notice in notices:
-            await update.message.reply_text(notice)
+            await reply_text_in_chunks(update.message, notice)
+        if stage_state:
+            total_elapsed = time.monotonic() - stage_state["started_at"]
+            save_last_request_timing(
+                chat_id,
+                "fast" if fast_mode else "full",
+                total_elapsed,
+                stage_state,
+            )
         save_chat_turn(chat_id, user_text, answer)
         await send_formatted_answer(update, answer)
 
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle_ask_request(update, context)
-
-
-async def ask_no_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_ask_request(update, context, force_no_search=True)
+
+
+async def ask_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_ask_request(update, context)
 
 
 async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_ask_request(update, context, fast_mode=True, usage_text=FAST_USAGE)
+
+
+async def application_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = getattr(context, "error", None)
+    exc_info = None
+    if error is not None:
+        exc_info = (type(error), error, error.__traceback__)
+    logger.error("Unhandled application error: %s", error, exc_info=exc_info)
+
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+
+    try:
+        await reply_text_in_chunks(
+            message,
+            "Something went wrong while processing that request. Please try again.",
+        )
+    except Exception:
+        logger.exception("Failed to send application error notice to Telegram.")
 
 
 def main() -> None:
@@ -1893,8 +2691,9 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("ask", ask_command))
-    app.add_handler(CommandHandler("asknosearch", ask_no_search_command))
+    app.add_handler(CommandHandler("asksearch", ask_search_command))
     app.add_handler(CommandHandler("fast", fast_command))
+    app.add_error_handler(application_error_handler)
 
     print("Bot is running. Press Ctrl+C to stop.")
     app.run_polling()
