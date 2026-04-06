@@ -1,12 +1,18 @@
-# Telegram Hybrid Research Bot with Ollama + Tavily
+# Telegram Hybrid Research Bot with Ollama + Exa/Tavily
 
-A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow, with both an auto-deciding default mode and explicit live-search commands.
+A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a practical workflow, with an auto-deciding default mode and explicit live-search commands.
 
 This repo is for builders who want to learn how a hybrid local + cloud system behaves in the real world, not just how to call one model once.
 
 ## What it does
 
-When a user runs `/asksearch ...`, the bot:
+The bot has three main answer paths:
+
+- `/ask ...` auto-decides whether live search is needed.
+- `/asksearch ...` always uses the full live-search workflow.
+- `/fast ...` always uses live search, but skips the local-model review step.
+
+When a request uses the full live-search workflow, the bot:
 
 1. Uses a **local planner model** to generate multiple search angles.
 2. Uses **Exa or Tavily live web search** to collect a broad shared candidate pool.
@@ -15,7 +21,7 @@ When a user runs `/asksearch ...`, the bot:
 5. Sends the broad evidence pool plus the local answer to **one cloud model**.
 6. Returns a final answer with staged progress updates in Telegram.
 
-When a user runs `/ask ...`, the bot decides whether live search is needed. It searches automatically for clearly current, comparative, sourced, or high-stakes questions, skips search for clearly evergreen explanations, and asks for a yes/no confirmation when the request is ambiguous.
+When a user runs `/ask ...`, the bot searches automatically for clearly current, comparative, sourced, or high-stakes questions; skips search for clearly evergreen explanations; and asks for a yes/no confirmation when the request is ambiguous. When it auto-decides without asking, it sends a short note under the answer saying whether search was used.
 
 When a user runs `/fast ...`, the bot keeps live search, skips the local-model review step, and asks Kimi for a concise answer.
 
@@ -45,6 +51,8 @@ Telegram
   |
 Command-only bot (/ask, /asksearch, /fast, /status, /clear)
   |
+Auto search decision (/ask only)
+  |
 Local search planner model
   |
 Exa or Tavily live web search
@@ -59,6 +67,8 @@ kimi-k2.5:cloud
   |
 Final synthesis
 ```
+
+For `/ask` questions that are auto-decided as no-search, the retrieval stage is replaced by a no-search context block and the bot still uses the local model plus Kimi for final synthesis. For `/fast`, the bot uses live retrieval plus Kimi and skips the local review step.
 
 ## Requirements
 
@@ -151,16 +161,28 @@ python bot.py
 Shows a short help message.
 
 ### `/status`
-Shows model assignments, timeout settings, search-pool limits, and memory status.
+Shows model assignments, timeout settings, search-pool limits, memory status, recent Exa/Tavily usage, and the most recent request timing/prompt-size metrics.
 
 ### `/ask your question`
 Auto-decides whether live search is needed. If the bot is unsure, it asks you to reply `yes` or `no`.
+
+If `/ask` auto-decides without asking, the bot adds a note below the answer:
+
+```text
+Search used: yes (auto-decided).
+```
+
+or:
+
+```text
+Search used: no (auto-decided).
+```
 
 ### `/asksearch your question`
 Runs the full hybrid workflow with live search.
 
 ### `/fast your question`
-Runs live search, skips the local-model debate, and returns a concise answer.
+Runs live search, skips the local-model review step, and returns a concise answer.
 
 ### `/clear`
 Clears rolling memory for the current Telegram chat.
@@ -198,9 +220,9 @@ This is in-memory only. If the process restarts, memory resets.
 
 This repo uses a **shared-evidence** design:
 
-- The bot plans the search angles locally.
-- The bot gathers evidence centrally.
-- The local model reviews a trimmed local-only pool.
+- The bot plans search angles locally when search is needed.
+- The bot gathers evidence centrally from Exa first, then Tavily, then Ollama web search fallback when configured.
+- The local model reviews a trimmed local-only pool so it is not forced to read the full broad retrieval set.
 - The final model sees the broad pool plus any local-model answer that was produced.
 
 That makes it easier to compare model behavior without introducing too many moving parts at once.
@@ -212,6 +234,9 @@ If you want live data without the full multi-model analysis, use `/fast`.
 
 Useful knobs in `bot.py`:
 
+- `SEARCH_RETRIEVAL_MODEL`
+- `EXA_SEARCH_TYPE`
+- `EXA_HIGHLIGHTS_MAX_CHARS`
 - `SEARCH_QUERY_LIMIT`
 - `SEARCH_RESULTS_PER_QUERY`
 - `TOTAL_CANDIDATE_LIMIT`
@@ -225,6 +250,33 @@ Useful knobs in `bot.py`:
 
 The bot also keeps a persistent search cache on disk. Repeated normalized searches can reuse the same retrieval result for 12 hours by default instead of spending another Tavily or web-search call.
 It also keeps daily search stats on disk so `/status` can show recent Exa/Tavily usage and estimate how many uncached Tavily asks remain before the configured daily credit budget.
+
+### Current command behavior
+
+- `/ask` is the normal default. It decides whether search is needed, asks for clarification when ambiguous, and reports whether search was used when it chooses automatically.
+- `/asksearch` bypasses that decision and always runs the full search workflow.
+- `/fast` always searches, skips the local model review, and asks Kimi for a shorter answer.
+- `/clear` clears rolling chat memory and any pending `/ask` search decision for the chat.
+
+## Changes Made
+
+Recent project updates include:
+
+- Switched from two local review models to one default local model: `ministral-3:8b`.
+- Disabled `LOCAL_MODEL_2` by default while keeping the second local slot optional in code.
+- Changed `/ask` from a no-search command into an auto-search command.
+- Added `/asksearch` as the explicit full live-search command.
+- Removed the old `/asknosearch` command and references to it.
+- Added yes/no follow-up handling when `/ask` is unsure whether live search is needed.
+- Added the post-answer `Search used: yes/no (auto-decided).` note for silent `/ask` decisions.
+- Added Exa as the primary retrieval provider, using the official `exa-py` SDK.
+- Kept Tavily as fallback behind Exa and Ollama web search as an optional fallback.
+- Increased search breadth to support up to two planned queries and up to 20 results per query.
+- Added a trimmed local-only evidence pool so local models do not have to process the entire broad pool.
+- Increased the local-model timeout to `600s`.
+- Added per-stage timing and prompt-size diagnostics, visible in `/status`.
+- Added safer Telegram message chunking and transient timeout handling for status-message edits.
+- Added tests for search planning, Exa/Tavily fallback behavior, command routing, auto-search decisions, prompt metrics, and Telegram formatting.
 
 ### Timeouts are intentionally generous
 
