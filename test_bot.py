@@ -65,11 +65,36 @@ class BotHelpersTest(unittest.TestCase):
         self.assertTrue(bot.user_requested_no_search("No internet search, just answer from what you know."))
         self.assertFalse(bot.user_requested_no_search("Should I search the internet for this?"))
 
+    def test_decide_search_behavior_uses_search_for_current_questions(self):
+        decision = bot.decide_search_behavior("What are the top 5 news headlines from the last 72 hours?")
+
+        self.assertEqual(decision["decision"], bot.SEARCH_DECISION_USE_SEARCH)
+
+    def test_decide_search_behavior_uses_search_for_currently_wording(self):
+        decision = bot.decide_search_behavior("Is California currently the only state that requires a boater card?")
+
+        self.assertEqual(decision["decision"], bot.SEARCH_DECISION_USE_SEARCH)
+
+    def test_decide_search_behavior_skips_search_for_explanations(self):
+        decision = bot.decide_search_behavior("Explain TLS handshakes.")
+
+        self.assertEqual(decision["decision"], bot.SEARCH_DECISION_SKIP_SEARCH)
+
+    def test_decide_search_behavior_asks_user_for_borderline_factual_lookup(self):
+        decision = bot.decide_search_behavior("When was Gemini 2.5 Flash released?")
+
+        self.assertEqual(decision["decision"], bot.SEARCH_DECISION_ASK_USER)
+
+    def test_parse_yes_no_reply_accepts_search_confirmation_words(self):
+        self.assertEqual(bot.parse_yes_no_reply("yes"), bot.SEARCH_DECISION_USE_SEARCH)
+        self.assertEqual(bot.parse_yes_no_reply("no search"), bot.SEARCH_DECISION_SKIP_SEARCH)
+        self.assertIsNone(bot.parse_yes_no_reply("maybe"))
+
     def test_usage_text_mentions_asksearch_command(self):
         self.assertIn("/asksearch your question here", bot.ASK_USAGE)
         self.assertNotIn("/asknosearch", bot.ASK_USAGE)
         self.assertNotIn("--no-search", bot.ASK_USAGE)
-        self.assertIn("Use /ask for an answer without internet search.", bot.START_TEXT)
+        self.assertIn("Use /ask for an auto-decided answer.", bot.START_TEXT)
         self.assertIn("Use /asksearch for a full live-search answer.", bot.START_TEXT)
         self.assertIn("Use /fast for a concise live-search answer.", bot.START_TEXT)
 
@@ -717,7 +742,24 @@ class BotHelpersTest(unittest.TestCase):
 
         self.assertIn("SYNTHESIS GOAL:", prompt)
         self.assertIn("Produce a richer final response than the local model drafts.", prompt)
-        self.assertIn("Do not just average the two local answers.", prompt)
+        self.assertIn("Do not just average the local model drafts.", prompt)
+
+    def test_build_final_prompt_omits_second_model_section_when_disabled(self):
+        original_local_model_2 = bot.LOCAL_MODEL_2
+        bot.LOCAL_MODEL_2 = ""
+        try:
+            prompt = bot.build_final_prompt(
+                question="How should I pick a laptop?",
+                recent_chat_context="User wants help choosing a work machine.",
+                shared_pool="Battery life, thermals, RAM, repairability.",
+                local_answer_1="Pick the lightest option.",
+                local_answer_2="Unused answer.",
+            )
+        finally:
+            bot.LOCAL_MODEL_2 = original_local_model_2
+
+        self.assertIn(f"LOCAL MODEL 1 ({bot.LOCAL_MODEL_1}) ANSWER:", prompt)
+        self.assertNotIn("LOCAL MODEL 2", prompt)
 
     def test_fast_final_system_prompt_prefers_concise_direct_answers(self):
         self.assertIn("answer the user's question directly and concisely", bot.FAST_FINAL_SYSTEM_PROMPT)
@@ -818,6 +860,76 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_call.kwargs["parse_mode"], "HTML")
         self.assertNotIn("<pre>", first_call.args[0])
         self.assertIn("| Item | Price |", first_call.args[0])
+
+    async def test_handle_ask_request_prompts_when_search_decision_is_unclear(self):
+        update = MagicMock()
+        update.message = MagicMock()
+        update.effective_chat.id = 123
+        context = MagicMock()
+        context.args = ["When", "was", "Gemini", "2.5", "Flash", "released?"]
+        context.chat_data = {}
+
+        with patch("bot.reply_text_in_chunks", new=AsyncMock()) as mock_reply, patch(
+            "bot.execute_question_request",
+            new=AsyncMock(),
+        ) as mock_execute:
+            await bot.handle_ask_request(update, context, search_policy="auto")
+
+        self.assertIn(bot.PENDING_SEARCH_DECISION_KEY, context.chat_data)
+        self.assertEqual(mock_execute.await_count, 0)
+        self.assertEqual(mock_reply.await_count, 1)
+
+    async def test_pending_search_decision_reply_runs_saved_question(self):
+        update = MagicMock()
+        update.effective_message = MagicMock()
+        update.effective_message.text = "yes"
+        context = MagicMock()
+        context.chat_data = {
+            bot.PENDING_SEARCH_DECISION_KEY: {
+                "question": "When was Gemini 2.5 Flash released?"
+            }
+        }
+
+        with patch("bot.execute_question_request", new=AsyncMock()) as mock_execute:
+            await bot.pending_search_decision_reply(update, context)
+
+        self.assertNotIn(bot.PENDING_SEARCH_DECISION_KEY, context.chat_data)
+        self.assertEqual(mock_execute.await_count, 1)
+        self.assertFalse(mock_execute.await_args.kwargs["force_no_search"])
+
+    async def test_handle_ask_request_auto_search_adds_post_answer_note(self):
+        update = MagicMock()
+        update.message = MagicMock()
+        update.effective_chat.id = 123
+        context = MagicMock()
+        context.args = ["What", "are", "the", "top", "5", "news", "headlines", "today?"]
+        context.chat_data = {}
+
+        with patch("bot.execute_question_request", new=AsyncMock()) as mock_execute:
+            await bot.handle_ask_request(update, context, search_policy="auto")
+
+        self.assertEqual(mock_execute.await_count, 1)
+        self.assertEqual(
+            mock_execute.await_args.kwargs["post_answer_note"],
+            "Search used: yes (auto-decided).",
+        )
+
+    async def test_handle_ask_request_auto_no_search_adds_post_answer_note(self):
+        update = MagicMock()
+        update.message = MagicMock()
+        update.effective_chat.id = 123
+        context = MagicMock()
+        context.args = ["Explain", "TLS", "handshakes."]
+        context.chat_data = {}
+
+        with patch("bot.execute_question_request", new=AsyncMock()) as mock_execute:
+            await bot.handle_ask_request(update, context, search_policy="auto")
+
+        self.assertEqual(mock_execute.await_count, 1)
+        self.assertEqual(
+            mock_execute.await_args.kwargs["post_answer_note"],
+            "Search used: no (auto-decided).",
+        )
 
 
 if __name__ == "__main__":
