@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from telegram import Update
 from telegram.error import BadRequest, TimedOut
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from ollama import chat
 from dotenv import load_dotenv
 
@@ -28,8 +28,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
-LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "qwen3:14b")
-LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "gemma3:12b")
+LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "ministral-3:8b").strip()
+LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "").strip()
 CLOUD_MODEL = os.getenv("CLOUD_MODEL", "kimi-k2.5:cloud")
 SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", LOCAL_MODEL_1)
 SEARCH_RETRIEVAL_MODEL = os.getenv("SEARCH_RETRIEVAL_MODEL", "tavily-search")
@@ -69,12 +69,15 @@ SEARCH_CACHE = {}
 SEARCH_CACHE_LOCK = threading.Lock()
 SEARCH_STATS = {}
 SEARCH_STATS_LOCK = threading.Lock()
+LOCAL_MODEL_STAGES = [("local_model_1", LOCAL_MODEL_1)]
+if LOCAL_MODEL_2:
+    LOCAL_MODEL_STAGES.append(("local_model_2", LOCAL_MODEL_2))
+
 PROGRESS_STAGES = [
     ("starting", "Starting request"),
     ("planning", "Planning search"),
     ("search_pool", "Gathering evidence"),
-    ("local_model_1", f"Running {LOCAL_MODEL_1}"),
-    ("local_model_2", f"Running {LOCAL_MODEL_2}"),
+    *[(stage_key, f"Running {model_name}") for stage_key, model_name in LOCAL_MODEL_STAGES],
     ("final", f"Running {CLOUD_MODEL}"),
     ("sending", "Sending answer"),
 ]
@@ -103,11 +106,10 @@ You will receive:
 - the user's current question
 - recent chat context from this Telegram chat
 - a broad shared search pool
-- an answer from local model 1
-- an answer from local model 2
+- one or more local model answers
 
 Your tasks:
-- Give your own full final answer, using the broad shared pool, recent chat context when relevant, and both local answers.
+- Give your own full final answer, using the broad shared pool, recent chat context when relevant, and any local model answers that are provided.
 
 Rules:
 - Prioritize correctness over speed or confidence.
@@ -164,7 +166,7 @@ Output only the user-facing answer.
 
 START_TEXT = (
     "Bot is working.\n\n"
-    "Use /ask for an answer without internet search.\n"
+    "Use /ask for an auto-decided answer. The bot will search when needed, skip search when it is clearly unnecessary, and ask if it is unsure.\n"
     "Use /asksearch for a full live-search answer.\n"
     "Use /fast for a concise live-search answer.\n"
     f"In groups, use /ask@{BOT_USERNAME} or /asksearch@{BOT_USERNAME}.\n"
@@ -176,7 +178,7 @@ ASK_USAGE = (
     "/ask your question here\n"
     "/asksearch your question here\n\n"
     "Example:\n"
-    "/ask explain TLS handshakes from general knowledge\n"
+    "/ask explain TLS handshakes\n"
     "/asksearch what are the top 5 news headlines from the last 72 hours?"
 )
 
@@ -186,6 +188,11 @@ FAST_USAGE = (
     "Example:\n"
     "/fast what are the hours for Costco in Seattle today?"
 )
+
+PENDING_SEARCH_DECISION_KEY = "pending_search_decision"
+SEARCH_DECISION_USE_SEARCH = "use_search"
+SEARCH_DECISION_SKIP_SEARCH = "skip_search"
+SEARCH_DECISION_ASK_USER = "ask_user"
 
 
 class TavilySearchError(RuntimeError):
@@ -529,6 +536,65 @@ def user_requested_no_search(question: str) -> bool:
         r"\bno browsing\b",
     ]
     return any(re.search(pattern, text) for pattern in patterns)
+
+
+def parse_yes_no_reply(text: str) -> str | None:
+    normalized = normalize_whitespace(text).lower()
+    if normalized in {"yes", "y", "search", "use search", "yes search", "web search", "browse"}:
+        return SEARCH_DECISION_USE_SEARCH
+    if normalized in {"no", "n", "no search", "skip search", "don't search", "do not search"}:
+        return SEARCH_DECISION_SKIP_SEARCH
+    return None
+
+
+def decide_search_behavior(question: str, recent_chat_context: str = "") -> dict:
+    text = normalize_whitespace(question)
+    lowered = text.lower()
+
+    if not text:
+        return {"decision": SEARCH_DECISION_SKIP_SEARCH, "reason": "Empty prompt."}
+
+    if user_requested_no_search(text):
+        return {"decision": SEARCH_DECISION_SKIP_SEARCH, "reason": "User explicitly asked not to browse."}
+
+    explicit_search_patterns = [
+        r"\b(search|look up|lookup|browse|check online|find online|verify online)\b",
+        r"\b(latest|most recent|recent|current|currently|today|today's|tonight|yesterday|tomorrow|now|right now|this week|last week|up to date|up-to-date)\b",
+        r"\bas of (today|now|this week|this month|this year|20\d{2})\b",
+        r"^\bis\b.+\bstill\b",
+        r"\b(news|headline|weather|forecast|score|scores|standings|schedule|stock price|share price|exchange rate)\b",
+        r"\b(open now|hours|closing time|phone number|address|menu|availability|price today)\b",
+        r"\b(quote|quotes|citation|citations|source|sources|link|links)\b",
+        r"\b(recommend|best|top|compare|comparison|vs\.?|versus)\b",
+        r"\b(buy|purchase|worth it|budget|cost to own|costs to own|which should i buy)\b",
+        r"\b(medical|legal|tax|taxes|financial|finance|investment|insurance|laws?|regulations?)\b",
+    ]
+    if any(re.search(pattern, lowered) for pattern in explicit_search_patterns):
+        return {"decision": SEARCH_DECISION_USE_SEARCH, "reason": "Question looks current, comparative, sourced, or high-stakes."}
+
+    stable_knowledge_patterns = [
+        r"^(what is|what are)\b",
+        r"^(explain|define|summarize|translate|rewrite)\b",
+        r"^(how does|how do|why does|why do)\b",
+        r"\bfrom general knowledge\b",
+        r"\bwithout internet search\b",
+        r"\bno search\b",
+        r"\bpython\b|\bjavascript\b|\btypescript\b|\breact\b|\bsql\b|\bregex\b|\btls\b|\bhttp\b",
+    ]
+    if any(re.search(pattern, lowered) for pattern in stable_knowledge_patterns):
+        return {"decision": SEARCH_DECISION_SKIP_SEARCH, "reason": "Question looks like evergreen explanation or writing help."}
+
+    factual_lookup_patterns = [
+        r"^(who is|who was|when was|when did|where is|which is|is [a-z0-9].+\?)",
+        r"\b(released|release date|founded|founded by|ceo|president|governor|capital)\b",
+    ]
+    if any(re.search(pattern, lowered) for pattern in factual_lookup_patterns):
+        return {"decision": SEARCH_DECISION_ASK_USER, "reason": "This looks like a factual lookup that may or may not need live verification."}
+
+    if len(lowered.split()) <= 10:
+        return {"decision": SEARCH_DECISION_ASK_USER, "reason": "Short prompt without clear freshness or explanation signals."}
+
+    return {"decision": SEARCH_DECISION_SKIP_SEARCH, "reason": "No strong signal that live web retrieval is necessary."}
 
 
 def load_search_cache() -> None:
@@ -1750,6 +1816,12 @@ Do not mention other models.
 
 def build_final_prompt(question: str, recent_chat_context: str, shared_pool: str, local_answer_1: str, local_answer_2: str) -> str:
     current_date_context = build_current_date_context()
+    local_sections = [
+        f"LOCAL MODEL 1 ({LOCAL_MODEL_1}) ANSWER:\n{local_answer_1}",
+    ]
+    if LOCAL_MODEL_2:
+        local_sections.append(f"LOCAL MODEL 2 ({LOCAL_MODEL_2}) ANSWER:\n{local_answer_2}")
+
     return f"""{current_date_context}
 
 RECENT CHAT CONTEXT:
@@ -1759,16 +1831,12 @@ CURRENT USER QUESTION:
 {question}
 
 SYNTHESIS GOAL:
-Produce a richer final response than the local model drafts. Combine the strongest evidence, resolve gaps or weak spots, and expand with useful explanation when it helps the user. Do not just average the two local answers.
+Produce a richer final response than the local model drafts. Combine the strongest evidence, resolve gaps or weak spots, and expand with useful explanation when it helps the user. Do not just average the local model drafts.
 
 BROAD SHARED SEARCH POOL:
 {shared_pool}
 
-LOCAL MODEL 1 ({LOCAL_MODEL_1}) ANSWER:
-{local_answer_1}
-
-LOCAL MODEL 2 ({LOCAL_MODEL_2}) ANSWER:
-{local_answer_2}
+{"\n\n".join(local_sections)}
 """
 
 
@@ -1797,21 +1865,30 @@ def build_fallback_answer(
     local_answer_2: str,
     final_error: str,
 ) -> str:
-    return (
+    sections = [
         "Local model 1 summary:\n"
-        f"{LOCAL_MODEL_1} returned a draft answer.\n\n"
-        "Local model 2 summary:\n"
-        f"{LOCAL_MODEL_2} returned a draft answer.\n\n"
-        "Differences:\n"
-        "Cloud synthesis failed, so this is a fallback response.\n\n"
-        "Final answer:\n"
-        f"I could not complete the cloud synthesis step.\n"
-        f"Cloud error: {final_error}\n\n"
-        f"Question:\n{question}\n\n"
-        f"Broad shared search pool:\n{shared_pool}\n\n"
-        f"{LOCAL_MODEL_1} answer:\n{local_answer_1}\n\n"
-        f"{LOCAL_MODEL_2} answer:\n{local_answer_2}"
+        f"{LOCAL_MODEL_1} returned a draft answer."
+    ]
+    if LOCAL_MODEL_2:
+        sections.append(
+            "Local model 2 summary:\n"
+            f"{LOCAL_MODEL_2} returned a draft answer."
+        )
+    sections.extend(
+        [
+            "Differences:\n"
+            "Cloud synthesis failed, so this is a fallback response.",
+            "Final answer:\n"
+            f"I could not complete the cloud synthesis step.\n"
+            f"Cloud error: {final_error}",
+            f"Question:\n{question}",
+            f"Broad shared search pool:\n{shared_pool}",
+            f"{LOCAL_MODEL_1} answer:\n{local_answer_1}",
+        ]
     )
+    if LOCAL_MODEL_2:
+        sections.append(f"{LOCAL_MODEL_2} answer:\n{local_answer_2}")
+    return "\n\n".join(sections)
 
 
 def build_fast_fallback_answer(question: str, shared_pool: str, final_error: str) -> str:
@@ -2364,7 +2441,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         "stage": "starting",
         "started_at": time.monotonic(),
         "completed_stages": set(),
-        "skipped_stages": set(),
+        "skipped_stages": {"local_model_2"} if not LOCAL_MODEL_2 else set(),
         "detail": "Request received. Initializing pipeline.",
     }
     stop_event = asyncio.Event()
@@ -2405,18 +2482,21 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
             local_answer_1 = f"{LOCAL_MODEL_1} failed: {local_error_1}"
         record_prompt_metrics(stage_state, "local_answer_1", local_answer_1)
 
-        local_answer_2, local_error_2 = await run_ollama_step(
-            status_message=status_message,
-            stage_state=stage_state,
-            stage_key="local_model_2",
-            stage_label=f"Asking {LOCAL_MODEL_2} to review the shared evidence.",
-            model_name=LOCAL_MODEL_2,
-            user_text=local_prompt,
-            system_prompt=LOCAL_SYSTEM_PROMPT,
-            timeout_seconds=LOCAL_MODEL_TIMEOUT_SECONDS,
-        )
-        if local_error_2:
-            local_answer_2 = f"{LOCAL_MODEL_2} failed: {local_error_2}"
+        if LOCAL_MODEL_2:
+            local_answer_2, local_error_2 = await run_ollama_step(
+                status_message=status_message,
+                stage_state=stage_state,
+                stage_key="local_model_2",
+                stage_label=f"Asking {LOCAL_MODEL_2} to review the shared evidence.",
+                model_name=LOCAL_MODEL_2,
+                user_text=local_prompt,
+                system_prompt=LOCAL_SYSTEM_PROMPT,
+                timeout_seconds=LOCAL_MODEL_TIMEOUT_SECONDS,
+            )
+            if local_error_2:
+                local_answer_2 = f"{LOCAL_MODEL_2} failed: {local_error_2}"
+        else:
+            local_answer_2 = "Local model 2 is disabled."
         record_prompt_metrics(stage_state, "local_answer_2", local_answer_2)
 
         final_prompt = build_final_prompt(
@@ -2556,7 +2636,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Tavily search depth: {TAVILY_SEARCH_DEPTH}\n"
         f"Exa search type: {EXA_SEARCH_TYPE}\n"
         f"Local model 1: {LOCAL_MODEL_1}\n"
-        f"Local model 2: {LOCAL_MODEL_2}\n"
+        f"Local model 2: {LOCAL_MODEL_2 or 'disabled'}\n"
         f"Cloud model: {CLOUD_MODEL}\n"
         f"Search query limit: {SEARCH_QUERY_LIMIT}\n"
         f"Search results per query: {SEARCH_RESULTS_PER_QUERY}\n"
@@ -2576,22 +2656,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     clear_chat_history(chat_id)
+    context.chat_data.pop(PENDING_SEARCH_DECISION_KEY, None)
     await reply_text_in_chunks(update.message, "Cleared this chat's rolling memory.")
 
 
-async def handle_ask_request(
+async def execute_question_request(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    user_text: str,
     force_no_search: bool = False,
     fast_mode: bool = False,
-    usage_text: str = ASK_USAGE,
+    post_answer_note: str | None = None,
 ) -> None:
-    user_text = normalize_whitespace(" ".join(context.args))
-
-    if not user_text:
-        await reply_text_in_chunks(update.message, usage_text)
-        return
-
     chat_id = update.effective_chat.id
     recent_chat_context = format_recent_chat_context(chat_id)
     chat_lock = get_chat_lock(chat_id)
@@ -2643,18 +2719,109 @@ async def handle_ask_request(
             )
         save_chat_turn(chat_id, user_text, answer)
         await send_formatted_answer(update, answer)
+        if post_answer_note:
+            await reply_text_in_chunks(update.message, post_answer_note)
+
+
+async def handle_ask_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    search_policy: str = "auto",
+    fast_mode: bool = False,
+    usage_text: str = ASK_USAGE,
+) -> None:
+    user_text = normalize_whitespace(" ".join(context.args))
+
+    if not user_text:
+        await reply_text_in_chunks(update.message, usage_text)
+        return
+
+    context.chat_data.pop(PENDING_SEARCH_DECISION_KEY, None)
+
+    if fast_mode:
+        await execute_question_request(update, context, user_text, fast_mode=True)
+        return
+
+    if search_policy == "force_search":
+        await execute_question_request(update, context, user_text, force_no_search=False)
+        return
+
+    if search_policy == "force_no_search":
+        await execute_question_request(update, context, user_text, force_no_search=True)
+        return
+
+    chat_id = update.effective_chat.id
+    recent_chat_context = format_recent_chat_context(chat_id)
+    search_decision = decide_search_behavior(user_text, recent_chat_context)
+    decision = search_decision.get("decision", SEARCH_DECISION_SKIP_SEARCH)
+
+    if decision == SEARCH_DECISION_USE_SEARCH:
+        await execute_question_request(
+            update,
+            context,
+            user_text,
+            force_no_search=False,
+            post_answer_note="Search used: yes (auto-decided).",
+        )
+        return
+
+    if decision == SEARCH_DECISION_SKIP_SEARCH:
+        await execute_question_request(
+            update,
+            context,
+            user_text,
+            force_no_search=True,
+            post_answer_note="Search used: no (auto-decided).",
+        )
+        return
+
+    context.chat_data[PENDING_SEARCH_DECISION_KEY] = {
+        "question": user_text,
+        "created_at": int(time.time()),
+        "reason": search_decision.get("reason", ""),
+    }
+    await reply_text_in_chunks(
+        update.message,
+        "I’m not sure whether this question needs live web search.\n"
+        f"Reason: {search_decision.get('reason', 'The request could reasonably go either way.')}\n\n"
+        "Reply with `yes` to use live search or `no` to answer from model knowledge only."
+    )
 
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle_ask_request(update, context, force_no_search=True)
+    await handle_ask_request(update, context, search_policy="auto")
 
 
 async def ask_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle_ask_request(update, context)
+    await handle_ask_request(update, context, search_policy="force_search")
 
 
 async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_ask_request(update, context, fast_mode=True, usage_text=FAST_USAGE)
+
+
+async def pending_search_decision_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = context.chat_data.get(PENDING_SEARCH_DECISION_KEY)
+    message = getattr(update, "effective_message", None)
+    if not pending or message is None:
+        return
+
+    decision = parse_yes_no_reply(message.text or "")
+    if decision is None:
+        await reply_text_in_chunks(
+            message,
+            "I still have a pending `/ask` search decision for your last question. Reply `yes` to use live search or `no` to answer without it."
+        )
+        return
+
+    question = pending.get("question", "")
+    context.chat_data.pop(PENDING_SEARCH_DECISION_KEY, None)
+    await execute_question_request(
+        update,
+        context,
+        question,
+        force_no_search=(decision == SEARCH_DECISION_SKIP_SEARCH),
+    )
 
 
 async def application_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2693,6 +2860,7 @@ def main() -> None:
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("asksearch", ask_search_command))
     app.add_handler(CommandHandler("fast", fast_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pending_search_decision_reply))
     app.add_error_handler(application_error_handler)
 
     print("Bot is running. Press Ctrl+C to stop.")

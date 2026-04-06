@@ -1,6 +1,6 @@
 # Telegram Hybrid Research Bot with Ollama + Tavily
 
-A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow, with both a full live-search mode and a default no-search mode.
+A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a single practical workflow, with both an auto-deciding default mode and explicit live-search commands.
 
 This repo is for builders who want to learn how a hybrid local + cloud system behaves in the real world, not just how to call one model once.
 
@@ -11,20 +11,20 @@ When a user runs `/asksearch ...`, the bot:
 1. Uses a **local planner model** to generate multiple search angles.
 2. Uses **Exa or Tavily live web search** to collect a broad shared candidate pool.
 3. Captures per-query summaries and cited web sources for extra context.
-4. Sends the same evidence pool to **two local models**.
-5. Sends the evidence pool plus both local answers to **one cloud model**.
+4. Sends a trimmed local-only evidence pool to **one local model by default**.
+5. Sends the broad evidence pool plus the local answer to **one cloud model**.
 6. Returns a final answer with staged progress updates in Telegram.
 
-When a user runs `/ask ...`, the bot skips internet retrieval and answers from model knowledge plus recent chat context only.
+When a user runs `/ask ...`, the bot decides whether live search is needed. It searches automatically for clearly current, comparative, sourced, or high-stakes questions, skips search for clearly evergreen explanations, and asks for a yes/no confirmation when the request is ambiguous.
 
-When a user runs `/fast ...`, the bot keeps live search but skips the two local-model review steps and asks Kimi for a concise answer.
+When a user runs `/fast ...`, the bot keeps live search, skips the local-model review step, and asks Kimi for a concise answer.
 
 By default, the repo is configured as:
 
-- **Search planner:** `qwen3:14b`
+- **Search planner:** `ministral-3:8b`
 - **Search retrieval:** `exa-search`
-- **Local model 1:** `qwen3:14b`
-- **Local model 2:** `gemma3:12b`
+- **Local model 1:** `ministral-3:8b`
+- **Local model 2:** disabled
 - **Final synthesis:** `kimi-k2.5:cloud`
 
 ## Why this project is useful
@@ -50,10 +50,10 @@ Local search planner model
 Exa or Tavily live web search
   |
 Broad shared evidence pool
-  |            |
-qwen3:14b    gemma3:12b
-  |            |
-Independent local answers
+  |
+ministral-3:8b
+  |
+Local answer
   |
 kimi-k2.5:cloud
   |
@@ -66,7 +66,7 @@ Final synthesis
 - Ollama installed locally
 - A Telegram bot token from BotFather
 - An Exa API key or Tavily API key
-- Enough local hardware to run your chosen local models
+- Enough local hardware to run your chosen local model
 
 If you keep the default final model as `kimi-k2.5:cloud`, sign in locally with:
 
@@ -123,11 +123,10 @@ Optional variables:
 - `EXA_API_KEY` if you want Exa as the primary retrieval provider
 - `TAVILY_API_KEY` if you want Tavily as primary or as fallback behind Exa
 
-### 5. Pull the default local models once
+### 5. Pull the default local model once
 
 ```bash
-ollama pull qwen3:14b
-ollama pull gemma3:12b
+ollama pull ministral-3:8b
 ```
 
 You only need to do this the first time on a machine, or later if you want to update or replace models.
@@ -155,7 +154,7 @@ Shows a short help message.
 Shows model assignments, timeout settings, search-pool limits, and memory status.
 
 ### `/ask your question`
-Skips internet search and answers from model knowledge plus chat context only.
+Auto-decides whether live search is needed. If the bot is unsure, it asks you to reply `yes` or `no`.
 
 ### `/asksearch your question`
 Runs the full hybrid workflow with live search.
@@ -173,7 +172,7 @@ Recommended pattern in group chats:
 ```text
 /asksearch@your_bot_username what are the top 5 news stories from the last 72 hours?
 /fast@your_bot_username what are the hours for Pike Place Chowder today?
-/ask@your_bot_username explain TCP vs UDP from general knowledge
+/ask@your_bot_username explain TCP vs UDP
 ```
 
 Keep Telegram **Privacy Mode ON** unless you intentionally want different bot behavior in groups.
@@ -188,7 +187,7 @@ Example:
 /asksearch what are the top 5 market stories this week?
 /fast what time does Costco close today?
 /ask give me more detail on the gold-price story you mentioned
-/ask explain the last answer without using internet search
+/ask explain the last answer without internet search
 ```
 
 This is in-memory only. If the process restarts, memory resets.
@@ -201,12 +200,12 @@ This repo uses a **shared-evidence** design:
 
 - The bot plans the search angles locally.
 - The bot gathers evidence centrally.
-- Both local models judge the same pool.
-- The final model sees the same pool plus both local answers.
+- The local model reviews a trimmed local-only pool.
+- The final model sees the broad pool plus any local-model answer that was produced.
 
 That makes it easier to compare model behavior without introducing too many moving parts at once.
 
-If you intentionally want to bypass that retrieval layer, use `/ask`.
+If you intentionally want to bypass that retrieval layer, add "without internet search" to `/ask`.
 If you want live data without the full multi-model analysis, use `/fast`.
 
 ### Search breadth is configurable
@@ -248,7 +247,7 @@ Current limitations include:
 - in-memory chat history only
 - long-running requests can still feel slow
 - search quality depends heavily on the search plan and evidence-pool limits
-- default local models may be too heavy for smaller machines
+- the default local model may still be too heavy for smaller machines
 
 ## Repo contents
 
