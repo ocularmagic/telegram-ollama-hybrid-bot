@@ -3,6 +3,8 @@ import re
 import json
 import html
 import time
+import io
+import uuid
 import logging
 import asyncio
 import threading
@@ -38,6 +40,16 @@ TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
 TAVILY_DAILY_CREDIT_LIMIT = float(os.getenv("TAVILY_DAILY_CREDIT_LIMIT", "0"))
 EXA_SEARCH_TYPE = os.getenv("EXA_SEARCH_TYPE", "auto")
 EXA_HIGHLIGHTS_MAX_CHARS = int(os.getenv("EXA_HIGHLIGHTS_MAX_CHARS", "4000"))
+COMFYUI_BASE_URL = os.getenv("COMFYUI_BASE_URL", "http://127.0.0.1:8188").rstrip("/")
+COMFYUI_WORKFLOW_PATH = os.getenv("COMFYUI_WORKFLOW_PATH", "comfyui_workflow_api.json")
+COMFYUI_PROMPT_NODE_ID = os.getenv("COMFYUI_PROMPT_NODE_ID", "")
+COMFYUI_PROMPT_INPUT = os.getenv("COMFYUI_PROMPT_INPUT", "text")
+COMFYUI_CLIENT_ID = os.getenv("COMFYUI_CLIENT_ID", f"telegram-bot-{uuid.uuid4()}")
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "ComfyUI workflow")
+IMAGE_TIMEOUT_SECONDS = int(os.getenv("IMAGE_TIMEOUT_SECONDS", "600"))
+IMAGE_PROMPT_CHARS = int(os.getenv("IMAGE_PROMPT_CHARS", "2000"))
+IMAGE_PROMPT_PREFIX = os.getenv("IMAGE_PROMPT_PREFIX", "")
+IMAGE_PROMPT_SUFFIX = os.getenv("IMAGE_PROMPT_SUFFIX", "")
 
 MAX_TELEGRAM_CHUNK = 3500
 MAX_PRE_CHUNK = 3000
@@ -164,22 +176,33 @@ Your job:
 Output only the user-facing answer.
 """
 
+AVAILABLE_COMMANDS_TEXT = (
+    "Available commands:\n"
+    "/start - Show this help summary.\n"
+    "/status - Show config, limits, recent timings, usage, and this command list.\n"
+    "/ask <question> - Auto-decide whether live search is needed.\n"
+    "/asksearch <question> - Force the full live-search workflow.\n"
+    "/asknosearch <question> - Force an answer without internet search.\n"
+    "/image <prompt> - Generate an image locally with ComfyUI.\n"
+    "/fast <question> - Use live search, skip local review, and return a concise answer.\n"
+    "/clear - Clear this chat's rolling memory and pending search decision."
+)
+
 START_TEXT = (
     "Bot is working.\n\n"
-    "Use /ask for an auto-decided answer. The bot will search when needed, skip search when it is clearly unnecessary, and ask if it is unsure.\n"
-    "Use /asksearch for a full live-search answer.\n"
-    "Use /fast for a concise live-search answer.\n"
-    f"In groups, use /ask@{BOT_USERNAME} or /asksearch@{BOT_USERNAME}.\n"
-    "Use /clear to clear this chat's rolling memory."
+    f"{AVAILABLE_COMMANDS_TEXT}\n\n"
+    f"In groups, use /ask@{BOT_USERNAME}, /asksearch@{BOT_USERNAME}, or /asknosearch@{BOT_USERNAME}."
 )
 
 ASK_USAGE = (
     "Usage:\n"
     "/ask your question here\n"
     "/asksearch your question here\n\n"
+    "/asknosearch your question here\n\n"
     "Example:\n"
     "/ask explain TLS handshakes\n"
-    "/asksearch what are the top 5 news headlines from the last 72 hours?"
+    "/asksearch what are the top 5 news headlines from the last 72 hours?\n"
+    "/asknosearch explain TCP vs UDP from general knowledge"
 )
 
 FAST_USAGE = (
@@ -187,6 +210,13 @@ FAST_USAGE = (
     "/fast your question here\n\n"
     "Example:\n"
     "/fast what are the hours for Costco in Seattle today?"
+)
+
+IMAGE_USAGE = (
+    "Usage:\n"
+    "/image your image prompt here\n\n"
+    "Example:\n"
+    "/image a photorealistic orange tabby cat wearing tiny aviator goggles, cinematic lighting"
 )
 
 PENDING_SEARCH_DECISION_KEY = "pending_search_decision"
@@ -200,6 +230,10 @@ class TavilySearchError(RuntimeError):
 
 
 class ExaSearchError(RuntimeError):
+    pass
+
+
+class ImageGenerationError(RuntimeError):
     pass
 
 
@@ -529,6 +563,7 @@ def user_requested_no_search(question: str) -> bool:
         r"\bdo not search (the )?(internet|web|online)\b",
         r"\bdon'?t search (the )?(internet|web|online)\b",
         r"\bno (internet|web|online) search\b",
+        r"\bwithout (an? )?(internet|web|online) search\b",
         r"\bwithout (searching|browsing) (the )?(internet|web|online)\b",
         r"\bdo not browse (the )?(internet|web|online)\b",
         r"\bdon'?t browse (the )?(internet|web|online)\b",
@@ -1107,6 +1142,181 @@ def ollama_web_search(query: str, max_results: int = SEARCH_RESULTS_PER_QUERY) -
     )
     response["cache_hit"] = False
     return response
+
+
+def load_comfyui_workflow() -> dict:
+    if not COMFYUI_WORKFLOW_PATH:
+        raise ImageGenerationError("COMFYUI_WORKFLOW_PATH is not set.")
+    if not os.path.exists(COMFYUI_WORKFLOW_PATH):
+        raise ImageGenerationError(
+            f"ComfyUI workflow file not found: {COMFYUI_WORKFLOW_PATH}. "
+            "Export an API-format workflow from ComfyUI and set COMFYUI_WORKFLOW_PATH."
+        )
+
+    try:
+        with open(COMFYUI_WORKFLOW_PATH, "r", encoding="utf-8") as f:
+            workflow = json.load(f)
+    except Exception as e:
+        raise ImageGenerationError(f"Could not load ComfyUI workflow: {e}") from e
+
+    if not isinstance(workflow, dict):
+        raise ImageGenerationError("ComfyUI workflow must be a JSON object in API format.")
+    return workflow
+
+
+def replace_prompt_placeholders(value, prompt: str):
+    if isinstance(value, str):
+        return value.replace("{{prompt}}", prompt)
+    if isinstance(value, list):
+        return [replace_prompt_placeholders(item, prompt) for item in value]
+    if isinstance(value, dict):
+        return {key: replace_prompt_placeholders(item, prompt) for key, item in value.items()}
+    return value
+
+
+def infer_comfyui_prompt_target(workflow: dict) -> tuple[str, str] | None:
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        if node.get("class_type") == "PrimitiveStringMultiline" and isinstance(inputs.get("value"), str):
+            return str(node_id), "value"
+
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        if node.get("class_type") == "CLIPTextEncode" and isinstance(inputs.get("text"), str):
+            return str(node_id), "text"
+
+    return None
+
+
+def apply_comfyui_prompt(workflow: dict, prompt: str) -> dict:
+    workflow = replace_prompt_placeholders(workflow, prompt)
+
+    prompt_node_id = COMFYUI_PROMPT_NODE_ID
+    prompt_input = COMFYUI_PROMPT_INPUT
+    if not prompt_node_id:
+        inferred_target = infer_comfyui_prompt_target(workflow)
+        if inferred_target:
+            prompt_node_id, prompt_input = inferred_target
+
+    if prompt_node_id:
+        node = workflow.get(prompt_node_id)
+        if not isinstance(node, dict):
+            raise ImageGenerationError(f"ComfyUI prompt node {prompt_node_id!r} was not found in the workflow.")
+        inputs = node.setdefault("inputs", {})
+        if not isinstance(inputs, dict):
+            raise ImageGenerationError(f"Workflow node {prompt_node_id!r} does not have an inputs object.")
+        inputs[prompt_input] = prompt
+
+    return workflow
+
+
+def comfyui_api_json(path: str, payload: dict | None = None, timeout: int = 60) -> dict:
+    url = f"{COMFYUI_BASE_URL}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST" if payload is not None else "GET",
+        headers={"Content-Type": "application/json"} if payload is not None else {},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        raise ImageGenerationError(f"ComfyUI API HTTP {e.code}: {body}") from e
+    except urllib.error.URLError as e:
+        raise ImageGenerationError(f"ComfyUI API connection error: {e}") from e
+    except json.JSONDecodeError as e:
+        raise ImageGenerationError(f"ComfyUI API returned invalid JSON: {e}") from e
+
+
+def queue_comfyui_prompt(workflow: dict) -> str:
+    response = comfyui_api_json(
+        "/prompt",
+        {
+            "prompt": workflow,
+            "client_id": COMFYUI_CLIENT_ID,
+        },
+    )
+    prompt_id = response.get("prompt_id")
+    if not prompt_id:
+        raise ImageGenerationError(f"ComfyUI did not return a prompt_id: {response}")
+    return prompt_id
+
+
+def build_image_prompt(user_prompt: str) -> str:
+    parts = [
+        normalize_whitespace(IMAGE_PROMPT_PREFIX).strip(),
+        normalize_whitespace(user_prompt).strip(),
+        normalize_whitespace(IMAGE_PROMPT_SUFFIX).strip(),
+    ]
+    return truncate_text(", ".join(part for part in parts if part), IMAGE_PROMPT_CHARS).strip()
+
+
+def find_comfyui_output_images(history_item: dict) -> list[dict]:
+    outputs = history_item.get("outputs", {})
+    if not isinstance(outputs, dict):
+        return []
+
+    output_images = []
+    for output in outputs.values():
+        images = output.get("images", []) if isinstance(output, dict) else []
+        for image in images:
+            if isinstance(image, dict) and image.get("filename"):
+                output_images.append(image)
+    return output_images
+
+
+def fetch_comfyui_image(image_info: dict) -> bytes:
+    params = urllib.parse.urlencode(
+        {
+            "filename": image_info.get("filename", ""),
+            "subfolder": image_info.get("subfolder", ""),
+            "type": image_info.get("type", "output"),
+        }
+    )
+    url = f"{COMFYUI_BASE_URL}/view?{params}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        raise ImageGenerationError(f"ComfyUI image fetch HTTP {e.code}: {body}") from e
+    except urllib.error.URLError as e:
+        raise ImageGenerationError(f"ComfyUI image fetch connection error: {e}") from e
+
+
+def generate_comfyui_images(prompt: str) -> list[bytes]:
+    clean_prompt = build_image_prompt(prompt)
+    if not clean_prompt:
+        raise ImageGenerationError("Image prompt is empty.")
+
+    workflow = apply_comfyui_prompt(load_comfyui_workflow(), clean_prompt)
+    prompt_id = queue_comfyui_prompt(workflow)
+    deadline = time.monotonic() + IMAGE_TIMEOUT_SECONDS
+
+    while time.monotonic() < deadline:
+        history = comfyui_api_json(f"/history/{urllib.parse.quote(prompt_id)}", timeout=30)
+        history_item = history.get(prompt_id)
+        if isinstance(history_item, dict):
+            image_infos = find_comfyui_output_images(history_item)
+            if image_infos:
+                return [fetch_comfyui_image(image_info) for image_info in image_infos]
+        time.sleep(1)
+
+    raise ImageGenerationError(f"ComfyUI image generation timed out after {IMAGE_TIMEOUT_SECONDS}s.")
 
 
 def get_chat_history(chat_id: int):
@@ -2649,7 +2859,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Local model timeout: {LOCAL_MODEL_TIMEOUT_SECONDS}s\n"
         f"Final timeout: {FINAL_TIMEOUT_SECONDS}s\n\n"
         f"{timing_text}\n\n"
-        f"{format_today_search_stats()}"
+        f"{format_today_search_stats()}\n\n"
+        f"{AVAILABLE_COMMANDS_TEXT}"
     )
 
 
@@ -2796,8 +3007,73 @@ async def ask_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await handle_ask_request(update, context, search_policy="force_search")
 
 
+async def ask_no_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_ask_request(update, context, search_policy="force_no_search")
+
+
 async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_ask_request(update, context, fast_mode=True, usage_text=FAST_USAGE)
+
+
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    prompt = normalize_whitespace(" ".join(context.args))
+    if not prompt:
+        await reply_text_in_chunks(update.message, IMAGE_USAGE)
+        return
+
+    chat_id = update.effective_chat.id
+    chat_lock = get_chat_lock(chat_id)
+    if chat_lock.locked():
+        await reply_text_in_chunks(
+            update.message,
+            "A previous request is still running for this chat. Wait for it to finish or use /clear after it completes.",
+        )
+        return
+
+    status_message = await update.message.reply_text(
+        f"Generating image with ComfyUI...\nWorkflow: {COMFYUI_WORKFLOW_PATH}\nThis can take a while."
+    )
+
+    async with chat_lock:
+        started_at = time.monotonic()
+        try:
+            image_blobs = await asyncio.wait_for(
+                asyncio.to_thread(generate_comfyui_images, prompt),
+                timeout=IMAGE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await safe_edit_status_message(
+                status_message,
+                f"Image generation timed out after {IMAGE_TIMEOUT_SECONDS}s.",
+            )
+            return
+        except Exception as e:
+            logger.warning("Image generation failed: %s", e)
+            await safe_edit_status_message(status_message, "Image generation failed.")
+            await reply_text_in_chunks(
+                update.message,
+                "I couldn't generate the image.\n"
+                f"Error: {e}\n\n"
+                "Make sure ComfyUI is running, the Z-Image Turbo workflow works in ComfyUI, "
+                "and COMFYUI_WORKFLOW_PATH points to an API-format workflow JSON.",
+            )
+            return
+
+        elapsed = time.monotonic() - started_at
+        await safe_edit_status_message(
+            status_message,
+            f"Generated {len(image_blobs)} image(s) in {elapsed:.1f}s. Sending...",
+        )
+        caption = truncate_text(f"Generated with ComfyUI: {prompt}", 1000)
+        for index, image_bytes in enumerate(image_blobs, start=1):
+            image_file = io.BytesIO(image_bytes)
+            image_file.name = f"generated-image-{index}.png"
+            image_caption = caption if index == 1 else f"Generated with ComfyUI ({index}/{len(image_blobs)})"
+            await update.message.reply_photo(photo=image_file, caption=image_caption)
+        await safe_edit_status_message(
+            status_message,
+            f"Generated and sent {len(image_blobs)} image(s) in {elapsed:.1f}s.",
+        )
 
 
 async def pending_search_decision_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2859,6 +3135,8 @@ def main() -> None:
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("asksearch", ask_search_command))
+    app.add_handler(CommandHandler("asknosearch", ask_no_search_command))
+    app.add_handler(CommandHandler("image", image_command))
     app.add_handler(CommandHandler("fast", fast_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pending_search_decision_reply))
     app.add_error_handler(application_error_handler)

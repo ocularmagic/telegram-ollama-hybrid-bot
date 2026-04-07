@@ -1,0 +1,164 @@
+{
+  "54": {
+    "inputs": {
+      "text": [
+        "557",
+        0
+      ],
+      "clip": [
+        "568",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "55": {
+    "inputs": {
+      "samples": [
+        "272",
+        0
+      ],
+      "vae": [
+        "548",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "272": {
+    "inputs": {
+      "seed": 452081790714744,
+      "steps": 30,
+      "cfg": 7,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 1,
+      "model": [
+        "548",
+        0
+      ],
+      "positive": [
+        "54",
+        0
+      ],
+      "negative": [
+        "276",
+        0
+      ],
+      "latent_image": [
+        "560",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "276": {
+    "inputs": {
+      "text": "watermark, text, simple background, score_4, score_5, score_6, blurry, bad anatomy, low quality",
+      "clip": [
+        "548",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "292": {
+    "inputs": {
+      "samples": [
+        "513",
+        0
+      ],
+      "vae": [
+        "548",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "513": {
+    "inputs": {
+      "pixels": [
+        "55",
+        0
+      ],
+      "vae": [
+        "548",
+        2
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "548": {
+    "inputs": {
+      "ckpt_name": "animij_v10.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "557": {
+    "inputs": {
+      "value": "score_9, score_8_up, score_7_up, score_6_up, score_5_up, score_4_up, A happy alice in wonderland wearing a bikini corset, short skirt, no panties, walking in the forest looking back at the viewer., masterpiece, best quality, highly detailed, 8k"
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "String (Multiline)"
+    }
+  },
+  "558": {
+    "inputs": {
+      "filename_prefix": "2026-04-07/2026-04-07 - 12-57-37",
+      "images": [
+        "292",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "560": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "Empty Latent Image"
+    }
+  },
+  "568": {
+    "inputs": {
+      "stop_at_clip_layer": -2,
+      "clip": [
+        "548",
+        1
+      ]
+    },
+    "class_type": "CLIPSetLastLayer",
+    "_meta": {
+      "title": "CLIP Set Last Layer"
+    }
+  }
+}

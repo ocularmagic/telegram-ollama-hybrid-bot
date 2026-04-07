@@ -10,6 +10,8 @@ The bot has three main answer paths:
 
 - `/ask ...` auto-decides whether live search is needed.
 - `/asksearch ...` always uses the full live-search workflow.
+- `/asknosearch ...` always skips internet search.
+- `/image ...` generates an image locally through a ComfyUI workflow.
 - `/fast ...` always uses live search, but skips the local-model review step.
 
 When a request uses the full live-search workflow, the bot:
@@ -31,6 +33,7 @@ By default, the repo is configured as:
 - **Search retrieval:** `exa-search`
 - **Local model 1:** `ministral-3:8b`
 - **Local model 2:** disabled
+- **Image generation:** local ComfyUI workflow, configured with `COMFYUI_WORKFLOW_PATH`
 - **Final synthesis:** `kimi-k2.5:cloud`
 
 ## Why this project is useful
@@ -49,7 +52,7 @@ This is a good learning repo if you want hands-on experience with:
 ```text
 Telegram
   |
-Command-only bot (/ask, /asksearch, /fast, /status, /clear)
+Command-only bot (/ask, /asksearch, /asknosearch, /image, /fast, /status, /clear)
   |
 Auto search decision (/ask only)
   |
@@ -141,6 +144,8 @@ ollama pull ministral-3:8b
 
 You only need to do this the first time on a machine, or later if you want to update or replace models.
 
+For image generation, see [ComfyUI Image Setup](#comfyui-image-setup).
+
 ### 6. Start Ollama each time you want to run the bot
 
 Make sure the Ollama app is running, or start the server manually:
@@ -181,6 +186,12 @@ Search used: no (auto-decided).
 ### `/asksearch your question`
 Runs the full hybrid workflow with live search.
 
+### `/asknosearch your question`
+Forces an answer without internet search.
+
+### `/image your image prompt`
+Queues the prompt in your local ComfyUI workflow and sends all generated output images back to Telegram.
+
 ### `/fast your question`
 Runs live search, skips the local-model review step, and returns a concise answer.
 
@@ -195,6 +206,8 @@ Recommended pattern in group chats:
 /asksearch@your_bot_username what are the top 5 news stories from the last 72 hours?
 /fast@your_bot_username what are the hours for Pike Place Chowder today?
 /ask@your_bot_username explain TCP vs UDP
+/asknosearch@your_bot_username explain TCP vs UDP from general knowledge
+/image@your_bot_username a photorealistic orange tabby cat wearing tiny aviator goggles
 ```
 
 Keep Telegram **Privacy Mode ON** unless you intentionally want different bot behavior in groups.
@@ -209,7 +222,7 @@ Example:
 /asksearch what are the top 5 market stories this week?
 /fast what time does Costco close today?
 /ask give me more detail on the gold-price story you mentioned
-/ask explain the last answer without internet search
+/asknosearch explain the last answer without internet search
 ```
 
 This is in-memory only. If the process restarts, memory resets.
@@ -227,8 +240,62 @@ This repo uses a **shared-evidence** design:
 
 That makes it easier to compare model behavior without introducing too many moving parts at once.
 
-If you intentionally want to bypass that retrieval layer, add "without internet search" to `/ask`.
+If you intentionally want to bypass that retrieval layer, use `/asknosearch` or add "without internet search" to `/ask`.
 If you want live data without the full multi-model analysis, use `/fast`.
+
+### ComfyUI Image Setup
+
+The `/image` command uses your locally running ComfyUI instance, not Ollama image generation. The bot talks to ComfyUI over its local HTTP API.
+
+Current Windows desktop setup:
+
+- `COMFYUI_BASE_URL=http://127.0.0.1:8000`
+- `COMFYUI_WORKFLOW_PATH=comfyui_workflow_ui.json`
+- `COMFYUI_PROMPT_NODE_ID=557`
+- `COMFYUI_PROMPT_INPUT=value`
+
+The `comfyui_workflow_ui.json` file in this repo is a ComfyUI API-format workflow. In that workflow, node `557` is a `PrimitiveStringMultiline` node that feeds the positive prompt into the rest of the graph. The bot replaces that node’s `value` input with the text from Telegram.
+
+How `/image` works:
+
+- It receives the Telegram prompt after `/image`.
+- It optionally wraps the prompt with `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX`.
+- It loads the workflow JSON from `COMFYUI_WORKFLOW_PATH`.
+- It inserts the final prompt into the configured prompt node.
+- It queues the workflow through ComfyUI’s `/prompt` endpoint.
+- It polls ComfyUI’s `/history/{prompt_id}` endpoint.
+- It fetches every generated output image from ComfyUI’s `/view` endpoint.
+- It sends all generated images back to Telegram.
+
+If the workflow generates two images, the bot sends two Telegram photos. If you change the ComfyUI workflow batch size or output nodes, the bot sends however many image outputs ComfyUI reports in history.
+
+Prompt wrapping is configured with:
+
+```env
+IMAGE_PROMPT_PREFIX=
+IMAGE_PROMPT_SUFFIX=
+```
+
+Example:
+
+```env
+IMAGE_PROMPT_PREFIX=score_9, score_8_up, best quality, highly detailed
+IMAGE_PROMPT_SUFFIX=cinematic lighting, sharp focus
+```
+
+Then this Telegram command:
+
+```text
+/image a red fox sitting in a snowy forest
+```
+
+is sent to the workflow as:
+
+```text
+score_9, score_8_up, best quality, highly detailed, a red fox sitting in a snowy forest, cinematic lighting, sharp focus
+```
+
+If `/image` returns a connection refused error, open the ComfyUI UI in your browser and copy that base URL into `COMFYUI_BASE_URL`. The Windows desktop app may use `http://127.0.0.1:8000`, while portable/manual ComfyUI installs often use `http://127.0.0.1:8188`.
 
 ### Search breadth is configurable
 
@@ -237,6 +304,15 @@ Useful knobs in `bot.py`:
 - `SEARCH_RETRIEVAL_MODEL`
 - `EXA_SEARCH_TYPE`
 - `EXA_HIGHLIGHTS_MAX_CHARS`
+- `COMFYUI_BASE_URL`
+- `COMFYUI_WORKFLOW_PATH`
+- `COMFYUI_PROMPT_NODE_ID`
+- `COMFYUI_PROMPT_INPUT`
+- `IMAGE_MODEL`
+- `IMAGE_TIMEOUT_SECONDS`
+- `IMAGE_PROMPT_CHARS`
+- `IMAGE_PROMPT_PREFIX`
+- `IMAGE_PROMPT_SUFFIX`
 - `SEARCH_QUERY_LIMIT`
 - `SEARCH_RESULTS_PER_QUERY`
 - `TOTAL_CANDIDATE_LIMIT`
@@ -255,6 +331,8 @@ It also keeps daily search stats on disk so `/status` can show recent Exa/Tavily
 
 - `/ask` is the normal default. It decides whether search is needed, asks for clarification when ambiguous, and reports whether search was used when it chooses automatically.
 - `/asksearch` bypasses that decision and always runs the full search workflow.
+- `/asknosearch` bypasses that decision and always skips internet search.
+- `/image` calls the local ComfyUI API, queues the configured workflow, fetches all generated images from ComfyUI history, and sends them back to Telegram.
 - `/fast` always searches, skips the local model review, and asks Kimi for a shorter answer.
 - `/clear` clears rolling chat memory and any pending `/ask` search decision for the chat.
 
@@ -266,7 +344,9 @@ Recent project updates include:
 - Disabled `LOCAL_MODEL_2` by default while keeping the second local slot optional in code.
 - Changed `/ask` from a no-search command into an auto-search command.
 - Added `/asksearch` as the explicit full live-search command.
-- Removed the old `/asknosearch` command and references to it.
+- Reintroduced `/asknosearch` as an explicit forced no-search command.
+- Added `/image` for local ComfyUI image generation using a configurable API-format workflow.
+- Added `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX` so the bot can wrap Telegram image prompts with fixed style text.
 - Added yes/no follow-up handling when `/ask` is unsure whether live search is needed.
 - Added the post-answer `Search used: yes/no (auto-decided).` note for silent `/ask` decisions.
 - Added Exa as the primary retrieval provider, using the official `exa-py` SDK.
