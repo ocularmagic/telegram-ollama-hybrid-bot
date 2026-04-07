@@ -63,6 +63,7 @@ class BotHelpersTest(unittest.TestCase):
         self.assertTrue(bot.user_requested_no_search("Answer this, but do not search the internet."))
         self.assertTrue(bot.user_requested_no_search("Please help without browsing the web."))
         self.assertTrue(bot.user_requested_no_search("No internet search, just answer from what you know."))
+        self.assertTrue(bot.user_requested_no_search("Without an internet search, explain TCP vs UDP."))
         self.assertFalse(bot.user_requested_no_search("Should I search the internet for this?"))
 
     def test_decide_search_behavior_uses_search_for_current_questions(self):
@@ -90,17 +91,24 @@ class BotHelpersTest(unittest.TestCase):
         self.assertEqual(bot.parse_yes_no_reply("no search"), bot.SEARCH_DECISION_SKIP_SEARCH)
         self.assertIsNone(bot.parse_yes_no_reply("maybe"))
 
-    def test_usage_text_mentions_asksearch_command(self):
+    def test_usage_text_mentions_answer_commands(self):
+        self.assertIn("/ask your question here", bot.ASK_USAGE)
         self.assertIn("/asksearch your question here", bot.ASK_USAGE)
-        self.assertNotIn("/asknosearch", bot.ASK_USAGE)
+        self.assertIn("/asknosearch your question here", bot.ASK_USAGE)
         self.assertNotIn("--no-search", bot.ASK_USAGE)
-        self.assertIn("Use /ask for an auto-decided answer.", bot.START_TEXT)
-        self.assertIn("Use /asksearch for a full live-search answer.", bot.START_TEXT)
-        self.assertIn("Use /fast for a concise live-search answer.", bot.START_TEXT)
+        self.assertIn("/ask <question> - Auto-decide whether live search is needed.", bot.START_TEXT)
+        self.assertIn("/asksearch <question> - Force the full live-search workflow.", bot.START_TEXT)
+        self.assertIn("/asknosearch <question> - Force an answer without internet search.", bot.START_TEXT)
+        self.assertIn("/image <prompt> - Generate an image locally with ComfyUI.", bot.START_TEXT)
+        self.assertIn("/fast <question> - Use live search, skip local review, and return a concise answer.", bot.START_TEXT)
 
     def test_fast_usage_mentions_fast_command(self):
         self.assertIn("/fast your question here", bot.FAST_USAGE)
         self.assertIn("Costco", bot.FAST_USAGE)
+
+    def test_image_usage_mentions_image_command(self):
+        self.assertIn("/image your image prompt here", bot.IMAGE_USAGE)
+        self.assertIn("tabby cat", bot.IMAGE_USAGE)
 
     def test_build_no_search_pool_marks_search_as_skipped(self):
         result = bot.build_no_search_pool("Explain TLS handshakes.", "None")
@@ -638,6 +646,86 @@ class BotHelpersTest(unittest.TestCase):
         self.assertFalse(first_response["cache_hit"])
         self.assertTrue(second_response["cache_hit"])
 
+    def test_apply_comfyui_prompt_updates_configured_node(self):
+        original_node_id = bot.COMFYUI_PROMPT_NODE_ID
+        bot.COMFYUI_PROMPT_NODE_ID = "6"
+
+        try:
+            workflow = bot.apply_comfyui_prompt(
+                {
+                    "6": {
+                        "class_type": "CLIPTextEncode",
+                        "inputs": {"text": "{{prompt}}"},
+                    }
+                },
+                "a cat",
+            )
+        finally:
+            bot.COMFYUI_PROMPT_NODE_ID = original_node_id
+
+        self.assertEqual(workflow["6"]["inputs"]["text"], "a cat")
+
+    def test_apply_comfyui_prompt_infers_primitive_string_node(self):
+        original_node_id = bot.COMFYUI_PROMPT_NODE_ID
+        bot.COMFYUI_PROMPT_NODE_ID = ""
+
+        try:
+            workflow = bot.apply_comfyui_prompt(
+                {
+                    "54": {
+                        "class_type": "CLIPTextEncode",
+                        "inputs": {"text": ["557", 0]},
+                    },
+                    "557": {
+                        "class_type": "PrimitiveStringMultiline",
+                        "inputs": {"value": "old prompt"},
+                    },
+                },
+                "a cat",
+            )
+        finally:
+            bot.COMFYUI_PROMPT_NODE_ID = original_node_id
+
+        self.assertEqual(workflow["557"]["inputs"]["value"], "a cat")
+
+    def test_build_image_prompt_adds_prefix_and_suffix(self):
+        original_prefix = bot.IMAGE_PROMPT_PREFIX
+        original_suffix = bot.IMAGE_PROMPT_SUFFIX
+        bot.IMAGE_PROMPT_PREFIX = "score_9, best quality"
+        bot.IMAGE_PROMPT_SUFFIX = "cinematic lighting"
+
+        try:
+            prompt = bot.build_image_prompt("a cat")
+        finally:
+            bot.IMAGE_PROMPT_PREFIX = original_prefix
+            bot.IMAGE_PROMPT_SUFFIX = original_suffix
+
+        self.assertEqual(prompt, "score_9, best quality, a cat, cinematic lighting")
+
+    def test_find_comfyui_output_images_returns_all_images(self):
+        images = bot.find_comfyui_output_images(
+            {
+                "outputs": {
+                    "9": {
+                        "images": [
+                            {
+                                "filename": "ComfyUI_00001_.png",
+                                "subfolder": "",
+                                "type": "output",
+                            },
+                            {
+                                "filename": "ComfyUI_00002_.png",
+                                "subfolder": "",
+                                "type": "output",
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+
+        self.assertEqual([image["filename"] for image in images], ["ComfyUI_00001_.png", "ComfyUI_00002_.png"])
+
     def test_record_search_metrics_counts_tavily_and_cache_usage(self):
         bot.record_search_metrics(
             {
@@ -861,6 +949,23 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<pre>", first_call.args[0])
         self.assertIn("| Item | Price |", first_call.args[0])
 
+    async def test_status_command_includes_available_commands(self):
+        update = MagicMock()
+        update.effective_chat.id = 123
+        update.message = MagicMock()
+        context = MagicMock()
+
+        with patch("bot.reply_text_in_chunks", new=AsyncMock()) as mock_reply:
+            await bot.status_command(update, context)
+
+        status_text = mock_reply.await_args.args[1]
+        self.assertIn("Available commands:", status_text)
+        self.assertIn("/ask <question>", status_text)
+        self.assertIn("/asksearch <question>", status_text)
+        self.assertIn("/asknosearch <question>", status_text)
+        self.assertIn("/image <prompt>", status_text)
+        self.assertIn("/fast <question>", status_text)
+
     async def test_handle_ask_request_prompts_when_search_decision_is_unclear(self):
         update = MagicMock()
         update.message = MagicMock()
@@ -930,6 +1035,37 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
             mock_execute.await_args.kwargs["post_answer_note"],
             "Search used: no (auto-decided).",
         )
+
+    async def test_ask_no_search_command_forces_no_search(self):
+        update = MagicMock()
+        context = MagicMock()
+
+        with patch("bot.handle_ask_request", new=AsyncMock()) as mock_handle:
+            await bot.ask_no_search_command(update, context)
+
+        self.assertEqual(mock_handle.await_count, 1)
+        self.assertEqual(mock_handle.await_args.kwargs["search_policy"], "force_no_search")
+
+    async def test_image_command_sends_all_generated_photos(self):
+        update = MagicMock()
+        update.effective_chat.id = 123
+        update.message.reply_text = AsyncMock()
+        update.message.reply_photo = AsyncMock()
+        status_message = MagicMock()
+        status_message.text = "Generating image..."
+        status_message.edit_text = AsyncMock()
+        update.message.reply_text.return_value = status_message
+        context = MagicMock()
+        context.args = ["a", "cat"]
+
+        with patch("bot.generate_comfyui_images", return_value=[b"fake-png-1", b"fake-png-2"]):
+            await bot.image_command(update, context)
+
+        self.assertEqual(update.message.reply_photo.await_count, 2)
+        first_photo = update.message.reply_photo.await_args_list[0].kwargs["photo"]
+        second_photo = update.message.reply_photo.await_args_list[1].kwargs["photo"]
+        self.assertEqual(first_photo.getvalue(), b"fake-png-1")
+        self.assertEqual(second_photo.getvalue(), b"fake-png-2")
 
 
 if __name__ == "__main__":
