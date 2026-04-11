@@ -50,6 +50,9 @@ IMAGE_TIMEOUT_SECONDS = int(os.getenv("IMAGE_TIMEOUT_SECONDS", "600"))
 IMAGE_PROMPT_CHARS = int(os.getenv("IMAGE_PROMPT_CHARS", "2000"))
 IMAGE_PROMPT_PREFIX = os.getenv("IMAGE_PROMPT_PREFIX", "")
 IMAGE_PROMPT_SUFFIX = os.getenv("IMAGE_PROMPT_SUFFIX", "")
+XAI_BASE_URL = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1").rstrip("/")
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.20-multi-agent-0309")
+XAI_TIMEOUT_SECONDS = int(os.getenv("XAI_TIMEOUT_SECONDS", "1200"))
 
 MAX_TELEGRAM_CHUNK = 3500
 MAX_PRE_CHUNK = 3000
@@ -75,6 +78,7 @@ MEMORY_QUESTION_CHARS = int(os.getenv("MEMORY_QUESTION_CHARS", "1200"))
 MEMORY_ANSWER_CHARS = int(os.getenv("MEMORY_ANSWER_CHARS", "5000"))
 
 CHAT_MEMORY = {}
+GROK_MEMORY = {}
 CHAT_LOCKS = {}
 CHAT_LAST_REQUEST_TIMINGS = {}
 SEARCH_CACHE = {}
@@ -184,6 +188,8 @@ AVAILABLE_COMMANDS_TEXT = (
     "/asksearch <question> - Force the full live-search workflow.\n"
     "/asknosearch <question> - Force an answer without internet search.\n"
     "/image <prompt> - Generate an image locally with ComfyUI.\n"
+    "/grok <question> - Ask Grok without search tools.\n"
+    "/groksearch <question> - Ask Grok with xAI web search tools enabled.\n"
     "/fast <question> - Use live search, skip local review, and return a concise answer.\n"
     "/clear - Clear this chat's rolling memory and pending search decision."
 )
@@ -219,6 +225,15 @@ IMAGE_USAGE = (
     "/image a photorealistic orange tabby cat wearing tiny aviator goggles, cinematic lighting"
 )
 
+GROK_USAGE = (
+    "Usage:\n"
+    "/grok your question here\n"
+    "/groksearch your question here\n\n"
+    "Example:\n"
+    "/grok explain why TLS handshakes matter\n"
+    "/groksearch what are the top AI headlines today?"
+)
+
 PENDING_SEARCH_DECISION_KEY = "pending_search_decision"
 SEARCH_DECISION_USE_SEARCH = "use_search"
 SEARCH_DECISION_SKIP_SEARCH = "skip_search"
@@ -234,6 +249,10 @@ class ExaSearchError(RuntimeError):
 
 
 class ImageGenerationError(RuntimeError):
+    pass
+
+
+class XaiApiError(RuntimeError):
     pass
 
 
@@ -1144,6 +1163,101 @@ def ollama_web_search(query: str, max_results: int = SEARCH_RESULTS_PER_QUERY) -
     return response
 
 
+def extract_xai_response_text(response: dict) -> str:
+    output_text = response.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    parts = []
+    for output_item in response.get("output", []) or []:
+        if not isinstance(output_item, dict):
+            continue
+        content_items = output_item.get("content", [])
+        if isinstance(content_items, str):
+            parts.append(content_items)
+            continue
+        if not isinstance(content_items, list):
+            continue
+        for content_item in content_items:
+            if not isinstance(content_item, dict):
+                continue
+            text = content_item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+
+    if parts:
+        return "\n\n".join(parts).strip()
+
+    choices = response.get("choices", [])
+    if choices and isinstance(choices, list):
+        message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+    return ""
+
+
+def call_xai_model(question: str, grok_context: str = "None", use_search: bool = False) -> str:
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        raise XaiApiError("XAI_API_KEY is not set.")
+
+    system_prompt = (
+        "You are a precise, helpful assistant inside a Telegram bot. "
+        "Answer directly and naturally. If search tools are available, use them when helpful for current or factual claims. "
+        "Do not mention internal implementation details."
+    )
+    payload = {
+        "model": XAI_MODEL,
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    "RECENT GROK-ONLY CONTEXT:\n"
+                    f"{grok_context or 'None'}\n\n"
+                    "CURRENT USER QUESTION:\n"
+                    f"{question}"
+                ),
+            },
+        ],
+        "store": False,
+    }
+    if use_search:
+        payload["tools"] = [{"type": "web_search"}]
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{XAI_BASE_URL}/responses",
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=XAI_TIMEOUT_SECONDS) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        raise XaiApiError(f"xAI API HTTP {e.code}: {body}") from e
+    except urllib.error.URLError as e:
+        raise XaiApiError(f"xAI API connection error: {e}") from e
+
+    try:
+        response = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise XaiApiError(f"xAI API returned invalid JSON: {e}") from e
+
+    answer = extract_xai_response_text(response)
+    if not answer:
+        raise XaiApiError("xAI API returned no usable text.")
+    return answer
+
+
 def load_comfyui_workflow() -> dict:
     if not COMFYUI_WORKFLOW_PATH:
         raise ImageGenerationError("COMFYUI_WORKFLOW_PATH is not set.")
@@ -1323,6 +1437,10 @@ def get_chat_history(chat_id: int):
     return CHAT_MEMORY.get(chat_id, [])
 
 
+def get_grok_history(chat_id: int):
+    return GROK_MEMORY.get(chat_id, [])
+
+
 def get_chat_lock(chat_id: int) -> asyncio.Lock:
     lock = CHAT_LOCKS.get(chat_id)
     if lock is None:
@@ -1344,8 +1462,22 @@ def save_chat_turn(chat_id: int, question: str, final_answer: str) -> None:
         CHAT_MEMORY[chat_id] = history[-MAX_HISTORY_TURNS:]
 
 
+def save_grok_turn(chat_id: int, question: str, final_answer: str) -> None:
+    history = GROK_MEMORY.setdefault(chat_id, [])
+    history.append(
+        {
+            "question": truncate_text(question.strip(), MEMORY_QUESTION_CHARS),
+            "final_answer": truncate_text(final_answer.strip(), MEMORY_ANSWER_CHARS),
+            "timestamp": int(time.time()),
+        }
+    )
+    if len(history) > MAX_HISTORY_TURNS:
+        GROK_MEMORY[chat_id] = history[-MAX_HISTORY_TURNS:]
+
+
 def clear_chat_history(chat_id: int) -> None:
     CHAT_MEMORY.pop(chat_id, None)
+    GROK_MEMORY.pop(chat_id, None)
     CHAT_LOCKS.pop(chat_id, None)
     CHAT_LAST_REQUEST_TIMINGS.pop(chat_id, None)
 
@@ -1360,6 +1492,22 @@ def format_recent_chat_context(chat_id: int) -> str:
         lines.append(f"TURN {idx}")
         lines.append(f"User question: {turn.get('question', '')}")
         lines.append("Final bot answer:")
+        lines.append(turn.get("final_answer", ""))
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def format_recent_grok_context(chat_id: int) -> str:
+    history = get_grok_history(chat_id)
+    if not history:
+        return "None"
+
+    lines = []
+    for idx, turn in enumerate(history[-MAX_HISTORY_TURNS:], start=1):
+        lines.append(f"GROK TURN {idx}")
+        lines.append(f"User question: {turn.get('question', '')}")
+        lines.append("Grok answer:")
         lines.append(turn.get("final_answer", ""))
         lines.append("")
 
@@ -2848,6 +2996,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Local model 1: {LOCAL_MODEL_1}\n"
         f"Local model 2: {LOCAL_MODEL_2 or 'disabled'}\n"
         f"Cloud model: {CLOUD_MODEL}\n"
+        f"xAI model: {XAI_MODEL}\n"
         f"Search query limit: {SEARCH_QUERY_LIMIT}\n"
         f"Search results per query: {SEARCH_RESULTS_PER_QUERY}\n"
         f"Total candidate limit: {TOTAL_CANDIDATE_LIMIT}\n"
@@ -2880,7 +3029,6 @@ async def execute_question_request(
     post_answer_note: str | None = None,
 ) -> None:
     chat_id = update.effective_chat.id
-    recent_chat_context = format_recent_chat_context(chat_id)
     chat_lock = get_chat_lock(chat_id)
 
     if chat_lock.locked():
@@ -3076,6 +3224,67 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+async def handle_grok_request(update: Update, context: ContextTypes.DEFAULT_TYPE, use_search: bool = False) -> None:
+    user_text = normalize_whitespace(" ".join(context.args))
+    if not user_text:
+        await reply_text_in_chunks(update.message, GROK_USAGE)
+        return
+
+    chat_id = update.effective_chat.id
+    grok_context = format_recent_grok_context(chat_id)
+    chat_lock = get_chat_lock(chat_id)
+    if chat_lock.locked():
+        await reply_text_in_chunks(
+            update.message,
+            "A previous request is still running for this chat. Wait for it to finish or use /clear after it completes.",
+        )
+        return
+
+    status_message = await update.message.reply_text(
+        f"Asking {XAI_MODEL}{' with web search' if use_search else ''}..."
+    )
+
+    async with chat_lock:
+        started_at = time.monotonic()
+        try:
+            answer = await asyncio.wait_for(
+                asyncio.to_thread(call_xai_model, user_text, grok_context, use_search),
+                timeout=XAI_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await safe_edit_status_message(
+                status_message,
+                f"xAI request timed out after {XAI_TIMEOUT_SECONDS}s.",
+            )
+            return
+        except Exception as e:
+            logger.warning("xAI request failed: %s", e)
+            await safe_edit_status_message(status_message, "xAI request failed.")
+            await reply_text_in_chunks(
+                update.message,
+                "I couldn't get a Grok response.\n"
+                f"Error: {e}\n\n"
+                "Make sure XAI_API_KEY is set in .env and your xAI account has access to the configured model.",
+            )
+            return
+
+        elapsed = time.monotonic() - started_at
+        await safe_edit_status_message(
+            status_message,
+            f"Grok response completed in {elapsed:.1f}s.",
+        )
+        save_grok_turn(chat_id, user_text, answer)
+        await send_formatted_answer(update, answer)
+
+
+async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_grok_request(update, context, use_search=False)
+
+
+async def grok_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_grok_request(update, context, use_search=True)
+
+
 async def pending_search_decision_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pending = context.chat_data.get(PENDING_SEARCH_DECISION_KEY)
     message = getattr(update, "effective_message", None)
@@ -3137,6 +3346,8 @@ def main() -> None:
     app.add_handler(CommandHandler("asksearch", ask_search_command))
     app.add_handler(CommandHandler("asknosearch", ask_no_search_command))
     app.add_handler(CommandHandler("image", image_command))
+    app.add_handler(CommandHandler("grok", grok_command))
+    app.add_handler(CommandHandler("groksearch", grok_search_command))
     app.add_handler(CommandHandler("fast", fast_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pending_search_decision_reply))
     app.add_error_handler(application_error_handler)
