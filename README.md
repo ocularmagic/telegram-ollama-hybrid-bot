@@ -12,6 +12,8 @@ The bot has three main answer paths:
 - `/asksearch ...` always uses the full live-search workflow.
 - `/asknosearch ...` always skips internet search.
 - `/image ...` generates an image locally through a ComfyUI workflow.
+- `/grok ...` uses xAI Grok without search tools for testing a flagship LLM path.
+- `/groksearch ...` uses xAI Grok with the web search tool array enabled for testing a flagship LLM path.
 - `/fast ...` always uses live search, but skips the local-model review step.
 
 When a request uses the full live-search workflow, the bot:
@@ -34,6 +36,7 @@ By default, the repo is configured as:
 - **Local model 1:** `ministral-3:8b`
 - **Local model 2:** disabled
 - **Image generation:** local ComfyUI workflow, configured with `COMFYUI_WORKFLOW_PATH`
+- **Grok commands:** `grok-4.20-multi-agent-0309` through xAI Responses API for testing a flagship LLM path
 - **Final synthesis:** `kimi-k2.5:cloud`
 
 ## Why this project is useful
@@ -52,7 +55,7 @@ This is a good learning repo if you want hands-on experience with:
 ```text
 Telegram
   |
-Command-only bot (/ask, /asksearch, /asknosearch, /image, /fast, /status, /clear)
+Command-only bot (/ask, /asksearch, /asknosearch, /image, /grok, /groksearch, /fast, /status, /clear)
   |
 Auto search decision (/ask only)
   |
@@ -135,6 +138,7 @@ Optional variables:
 - `OLLAMA_API_KEY` if you want Ollama web-search fallback when Tavily is unavailable
 - `EXA_API_KEY` if you want Exa as the primary retrieval provider
 - `TAVILY_API_KEY` if you want Tavily as primary or as fallback behind Exa
+- `XAI_API_KEY` if you want to use `/grok` and `/groksearch`
 
 ### 5. Pull the default local model once
 
@@ -192,6 +196,12 @@ Forces an answer without internet search.
 ### `/image your image prompt`
 Queues the prompt in your local ComfyUI workflow and sends all generated output images back to Telegram.
 
+### `/grok your question`
+Sends the prompt directly to xAI using `grok-4.20-multi-agent-0309` without search tools as a standalone flagship LLM test path. This command does not use the bot's search-decision logic, local model review, Kimi synthesis, or regular `/ask` memory. It only includes previous `/grok` and `/groksearch` turns as Grok-only context.
+
+### `/groksearch your question`
+Sends the prompt directly to xAI using `grok-4.20-multi-agent-0309` as a standalone flagship LLM test path and includes `tools: [{"type": "web_search"}]` on every request. It only includes previous `/grok` and `/groksearch` turns as Grok-only context; the response is returned directly to Telegram.
+
 ### `/fast your question`
 Runs live search, skips the local-model review step, and returns a concise answer.
 
@@ -208,6 +218,8 @@ Recommended pattern in group chats:
 /ask@your_bot_username explain TCP vs UDP
 /asknosearch@your_bot_username explain TCP vs UDP from general knowledge
 /image@your_bot_username a photorealistic orange tabby cat wearing tiny aviator goggles
+/grok@your_bot_username explain quantum tunneling in plain language
+/groksearch@your_bot_username what are the latest AI headlines today?
 ```
 
 Keep Telegram **Privacy Mode ON** unless you intentionally want different bot behavior in groups.
@@ -313,6 +325,9 @@ Useful knobs in `bot.py`:
 - `IMAGE_PROMPT_CHARS`
 - `IMAGE_PROMPT_PREFIX`
 - `IMAGE_PROMPT_SUFFIX`
+- `XAI_BASE_URL`
+- `XAI_MODEL`
+- `XAI_TIMEOUT_SECONDS`
 - `SEARCH_QUERY_LIMIT`
 - `SEARCH_RESULTS_PER_QUERY`
 - `TOTAL_CANDIDATE_LIMIT`
@@ -333,6 +348,8 @@ It also keeps daily search stats on disk so `/status` can show recent Exa/Tavily
 - `/asksearch` bypasses that decision and always runs the full search workflow.
 - `/asknosearch` bypasses that decision and always skips internet search.
 - `/image` calls the local ComfyUI API, queues the configured workflow, fetches all generated images from ComfyUI history, and sends them back to Telegram.
+- `/grok` calls xAI's Responses API without tools as a flagship LLM test path, includes only Grok-command history as context, and returns the response directly to Telegram.
+- `/groksearch` calls xAI's Responses API with the `web_search` tool included in the `tools` array every time as a flagship LLM test path, includes only Grok-command history as context, and returns the response directly to Telegram.
 - `/fast` always searches, skips the local model review, and asks Kimi for a shorter answer.
 - `/clear` clears rolling chat memory and any pending `/ask` search decision for the chat.
 
@@ -347,6 +364,7 @@ Recent project updates include:
 - Reintroduced `/asknosearch` as an explicit forced no-search command.
 - Added `/image` for local ComfyUI image generation using a configurable API-format workflow.
 - Added `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX` so the bot can wrap Telegram image prompts with fixed style text.
+- Added `/grok` and `/groksearch` for testing a flagship xAI LLM path, with `/groksearch` sending the web search tool array on every request.
 - Added yes/no follow-up handling when `/ask` is unsure whether live search is needed.
 - Added the post-answer `Search used: yes/no (auto-decided).` note for silent `/ask` decisions.
 - Added Exa as the primary retrieval provider, using the official `exa-py` SDK.

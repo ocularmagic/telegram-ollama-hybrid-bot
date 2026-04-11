@@ -10,6 +10,7 @@ import bot
 class BotHelpersTest(unittest.TestCase):
     def setUp(self):
         bot.CHAT_MEMORY.clear()
+        bot.GROK_MEMORY.clear()
         bot.CHAT_LOCKS.clear()
         bot.CHAT_LAST_REQUEST_TIMINGS.clear()
         bot.SEARCH_CACHE.clear()
@@ -109,6 +110,10 @@ class BotHelpersTest(unittest.TestCase):
     def test_image_usage_mentions_image_command(self):
         self.assertIn("/image your image prompt here", bot.IMAGE_USAGE)
         self.assertIn("tabby cat", bot.IMAGE_USAGE)
+
+    def test_grok_usage_mentions_grok_commands(self):
+        self.assertIn("/grok your question here", bot.GROK_USAGE)
+        self.assertIn("/groksearch your question here", bot.GROK_USAGE)
 
     def test_build_no_search_pool_marks_search_as_skipped(self):
         result = bot.build_no_search_pool("Explain TLS handshakes.", "None")
@@ -726,6 +731,54 @@ class BotHelpersTest(unittest.TestCase):
 
         self.assertEqual([image["filename"] for image in images], ["ComfyUI_00001_.png", "ComfyUI_00002_.png"])
 
+    def test_call_xai_model_includes_web_search_tool_when_requested(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({"output_text": "answer"}).encode("utf-8")
+
+        with patch.dict(os.environ, {"XAI_API_KEY": "test-key"}), patch(
+            "bot.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ) as mock_urlopen:
+            answer = bot.call_xai_model("question", "previous grok answer", use_search=True)
+
+        self.assertEqual(answer, "answer")
+        request = mock_urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["model"], bot.XAI_MODEL)
+        self.assertEqual(payload["tools"], [{"type": "web_search"}])
+        self.assertIn("RECENT GROK-ONLY CONTEXT:", payload["input"][1]["content"])
+        self.assertIn("previous grok answer", payload["input"][1]["content"])
+        self.assertIn("CURRENT USER QUESTION:\nquestion", payload["input"][1]["content"])
+        self.assertNotIn("RECENT CHAT CONTEXT", json.dumps(payload))
+
+    def test_call_xai_model_omits_tools_without_search(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({"output_text": "answer"}).encode("utf-8")
+
+        with patch.dict(os.environ, {"XAI_API_KEY": "test-key"}), patch(
+            "bot.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ) as mock_urlopen:
+            bot.call_xai_model("question", "None", use_search=False)
+
+        request = mock_urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertNotIn("tools", payload)
+
     def test_record_search_metrics_counts_tavily_and_cache_usage(self):
         bot.record_search_metrics(
             {
@@ -805,6 +858,18 @@ class BotHelpersTest(unittest.TestCase):
 
         self.assertEqual(len(history), bot.MAX_HISTORY_TURNS)
         self.assertEqual(history[0]["question"], "q2")
+
+    def test_grok_memory_is_separate_from_regular_chat_memory(self):
+        bot.save_chat_turn(123, "regular question", "regular answer")
+        bot.save_grok_turn(123, "grok question", "grok answer")
+
+        regular_context = bot.format_recent_chat_context(123)
+        grok_context = bot.format_recent_grok_context(123)
+
+        self.assertIn("regular question", regular_context)
+        self.assertNotIn("grok question", regular_context)
+        self.assertIn("grok question", grok_context)
+        self.assertNotIn("regular question", grok_context)
 
     def test_get_chat_lock_reuses_lock_per_chat(self):
         self.assertIs(bot.get_chat_lock(1), bot.get_chat_lock(1))
@@ -964,6 +1029,8 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/asksearch <question>", status_text)
         self.assertIn("/asknosearch <question>", status_text)
         self.assertIn("/image <prompt>", status_text)
+        self.assertIn("/grok <question>", status_text)
+        self.assertIn("/groksearch <question>", status_text)
         self.assertIn("/fast <question>", status_text)
 
     async def test_handle_ask_request_prompts_when_search_decision_is_unclear(self):
@@ -1066,6 +1133,53 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         second_photo = update.message.reply_photo.await_args_list[1].kwargs["photo"]
         self.assertEqual(first_photo.getvalue(), b"fake-png-1")
         self.assertEqual(second_photo.getvalue(), b"fake-png-2")
+
+    async def test_grok_search_command_enables_search_tools(self):
+        update = MagicMock()
+        context = MagicMock()
+
+        with patch("bot.handle_grok_request", new=AsyncMock()) as mock_handle:
+            await bot.grok_search_command(update, context)
+
+        self.assertEqual(mock_handle.await_count, 1)
+        self.assertTrue(mock_handle.await_args.kwargs["use_search"])
+
+    async def test_grok_command_disables_search_tools(self):
+        update = MagicMock()
+        context = MagicMock()
+
+        with patch("bot.handle_grok_request", new=AsyncMock()) as mock_handle:
+            await bot.grok_command(update, context)
+
+        self.assertEqual(mock_handle.await_count, 1)
+        self.assertFalse(mock_handle.await_args.kwargs["use_search"])
+
+    async def test_handle_grok_request_uses_and_saves_grok_only_memory(self):
+        update = MagicMock()
+        update.effective_chat.id = 123
+        update.message.reply_text = AsyncMock()
+        status_message = MagicMock()
+        status_message.text = "Asking Grok..."
+        status_message.edit_text = AsyncMock()
+        update.message.reply_text.return_value = status_message
+        context = MagicMock()
+        context.args = ["standalone", "question"]
+        bot.save_chat_turn(123, "regular question", "regular answer")
+        bot.save_grok_turn(123, "previous grok question", "previous grok answer")
+
+        with patch("bot.call_xai_model", return_value="standalone answer") as mock_call, patch(
+            "bot.send_formatted_answer",
+            new=AsyncMock(),
+        ) as mock_send:
+            await bot.handle_grok_request(update, context, use_search=True)
+
+        self.assertEqual(mock_call.call_args.args[0], "standalone question")
+        self.assertIn("previous grok question", mock_call.call_args.args[1])
+        self.assertNotIn("regular question", mock_call.call_args.args[1])
+        self.assertTrue(mock_call.call_args.args[2])
+        self.assertEqual(len(bot.get_chat_history(123)), 1)
+        self.assertEqual(bot.get_grok_history(123)[-1]["question"], "standalone question")
+        self.assertEqual(mock_send.await_count, 1)
 
 
 if __name__ == "__main__":
