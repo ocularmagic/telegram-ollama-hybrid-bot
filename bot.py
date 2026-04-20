@@ -62,6 +62,7 @@ TAVILY_MAX_QUERY_CHARS = int(os.getenv("TAVILY_MAX_QUERY_CHARS", "400"))
 EVIDENCE_TIMEOUT_SECONDS = int(os.getenv("EVIDENCE_TIMEOUT_SECONDS", "300"))
 LOCAL_MODEL_TIMEOUT_SECONDS = int(os.getenv("LOCAL_MODEL_TIMEOUT_SECONDS", "600"))
 FINAL_TIMEOUT_SECONDS = int(os.getenv("FINAL_TIMEOUT_SECONDS", "600"))
+CLOUD_FINAL_MAX_ATTEMPTS = max(1, int(os.getenv("CLOUD_FINAL_MAX_ATTEMPTS", "2")))
 
 SEARCH_QUERY_LIMIT = int(os.getenv("SEARCH_QUERY_LIMIT", "2"))
 SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "20"))
@@ -2674,35 +2675,72 @@ async def run_ollama_step(
     user_text: str,
     system_prompt: str,
     timeout_seconds: int,
+    max_attempts: int = 1,
 ):
     stage_state["detail"] = stage_label
     await set_stage(status_message, stage_state, stage_key)
     started_at = time.monotonic()
+    max_attempts = max(1, int(max_attempts))
 
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                call_ollama_model,
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            stage_state["detail"] = f"{stage_label} Retrying {attempt}/{max_attempts}."
+            await set_stage(status_message, stage_state, stage_key)
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    call_ollama_model,
+                    model_name,
+                    user_text,
+                    system_prompt,
+                ),
+                timeout=timeout_seconds,
+            )
+            elapsed = time.monotonic() - started_at
+            record_stage_duration(stage_state, stage_key, elapsed)
+            logger.info(
+                "Stage timing | stage=%s model=%s elapsed=%.2fs attempt=%s/%s",
+                stage_key,
                 model_name,
-                user_text,
-                system_prompt,
-            ),
-            timeout=timeout_seconds,
-        )
-        elapsed = time.monotonic() - started_at
-        record_stage_duration(stage_state, stage_key, elapsed)
-        logger.info("Stage timing | stage=%s model=%s elapsed=%.2fs", stage_key, model_name, elapsed)
-        return result, None
-    except asyncio.TimeoutError:
-        elapsed = time.monotonic() - started_at
-        record_stage_duration(stage_state, stage_key, elapsed)
-        logger.warning("Stage timing | stage=%s model=%s outcome=timeout elapsed=%.2fs", stage_key, model_name, elapsed)
-        return "", f"{stage_label} timed out after {timeout_seconds} seconds."
-    except Exception as e:
-        elapsed = time.monotonic() - started_at
-        record_stage_duration(stage_state, stage_key, elapsed)
-        logger.warning("Stage timing | stage=%s model=%s outcome=error elapsed=%.2fs error=%s", stage_key, model_name, elapsed, e)
-        return "", f"{stage_label} failed: {e}"
+                elapsed,
+                attempt,
+                max_attempts,
+            )
+            return result, None
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - started_at
+            record_stage_duration(stage_state, stage_key, elapsed)
+            logger.warning("Stage timing | stage=%s model=%s outcome=timeout elapsed=%.2fs", stage_key, model_name, elapsed)
+            return "", f"{stage_label} timed out after {timeout_seconds} seconds."
+        except Exception as e:
+            elapsed = time.monotonic() - started_at
+            if attempt < max_attempts:
+                logger.warning(
+                    "Stage timing | stage=%s model=%s outcome=error elapsed=%.2fs attempt=%s/%s error=%s; retrying",
+                    stage_key,
+                    model_name,
+                    elapsed,
+                    attempt,
+                    max_attempts,
+                    e,
+                )
+                await asyncio.sleep(min(2, attempt))
+                continue
+
+            record_stage_duration(stage_state, stage_key, elapsed)
+            logger.warning(
+                "Stage timing | stage=%s model=%s outcome=error elapsed=%.2fs attempt=%s/%s error=%s",
+                stage_key,
+                model_name,
+                elapsed,
+                attempt,
+                max_attempts,
+                e,
+            )
+            return "", f"{stage_label} failed: {e}"
+
+    return "", f"{stage_label} failed."
 
 
 async def prepare_shared_pool(
@@ -2881,6 +2919,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
             user_text=final_prompt,
             system_prompt=CLOUD_FINAL_SYSTEM_PROMPT,
             timeout_seconds=FINAL_TIMEOUT_SECONDS,
+            max_attempts=CLOUD_FINAL_MAX_ATTEMPTS,
         )
 
         if final_error:
@@ -2950,6 +2989,7 @@ async def orchestrate_fast_answer(question: str, recent_chat_context: str, statu
             user_text=fast_prompt,
             system_prompt=FAST_FINAL_SYSTEM_PROMPT,
             timeout_seconds=FINAL_TIMEOUT_SECONDS,
+            max_attempts=CLOUD_FINAL_MAX_ATTEMPTS,
         )
 
         if final_error:
@@ -3007,6 +3047,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Evidence timeout: {EVIDENCE_TIMEOUT_SECONDS}s\n"
         f"Local model timeout: {LOCAL_MODEL_TIMEOUT_SECONDS}s\n"
         f"Final timeout: {FINAL_TIMEOUT_SECONDS}s\n\n"
+        f"Cloud final max attempts: {CLOUD_FINAL_MAX_ATTEMPTS}\n\n"
         f"{timing_text}\n\n"
         f"{format_today_search_stats()}\n\n"
         f"{AVAILABLE_COMMANDS_TEXT}"
@@ -3029,6 +3070,7 @@ async def execute_question_request(
     post_answer_note: str | None = None,
 ) -> None:
     chat_id = update.effective_chat.id
+    recent_chat_context = format_recent_chat_context(chat_id)
     chat_lock = get_chat_lock(chat_id)
 
     if chat_lock.locked():

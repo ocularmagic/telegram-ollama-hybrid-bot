@@ -987,6 +987,38 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status_message.edit_text.await_count, 1)
 
+    async def test_run_ollama_step_retries_transient_errors(self):
+        status_message = MagicMock()
+        status_message.text = "old"
+        status_message.edit_text = AsyncMock()
+        stage_state = {
+            "stage": "starting",
+            "started_at": bot.time.monotonic(),
+            "completed_stages": set(),
+            "skipped_stages": set(),
+        }
+
+        with patch(
+            "bot.call_ollama_model",
+            side_effect=[RuntimeError("Internal Server Error (status code: 500)"), "retry success"],
+        ) as mock_call, patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            answer, error = await bot.run_ollama_step(
+                status_message=status_message,
+                stage_state=stage_state,
+                stage_key="final",
+                stage_label="Asking cloud model.",
+                model_name="kimi-k2.5:cloud",
+                user_text="prompt",
+                system_prompt="system",
+                timeout_seconds=10,
+                max_attempts=2,
+            )
+
+        self.assertEqual(answer, "retry success")
+        self.assertIsNone(error)
+        self.assertEqual(mock_call.call_count, 2)
+        self.assertEqual(mock_sleep.await_count, 1)
+
     async def test_reply_text_in_chunks_splits_long_plaintext_messages(self):
         message = MagicMock()
         message.reply_text = AsyncMock()
@@ -1102,6 +1134,32 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
             mock_execute.await_args.kwargs["post_answer_note"],
             "Search used: no (auto-decided).",
         )
+
+    async def test_execute_question_request_builds_recent_chat_context(self):
+        chat_id = 987654
+        bot.CHAT_MEMORY.clear()
+        bot.CHAT_LOCKS.clear()
+        bot.save_chat_turn(chat_id, "previous context question", "previous context answer")
+
+        update = MagicMock()
+        update.effective_chat.id = chat_id
+        update.message.reply_text = AsyncMock()
+        status_message = MagicMock()
+        update.message.reply_text.return_value = status_message
+        context = MagicMock()
+
+        with patch(
+            "bot.orchestrate_answer",
+            new=AsyncMock(return_value=("final answer", [], None)),
+        ) as mock_orchestrate, patch(
+            "bot.send_formatted_answer",
+            new=AsyncMock(),
+        ) as mock_send:
+            await bot.execute_question_request(update, context, "new question")
+
+        self.assertEqual(mock_orchestrate.await_count, 1)
+        self.assertIn("previous context question", mock_orchestrate.await_args.args[1])
+        self.assertEqual(mock_send.await_count, 1)
 
     async def test_ask_no_search_command_forces_no_search(self):
         update = MagicMock()
