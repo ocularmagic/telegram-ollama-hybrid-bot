@@ -328,6 +328,7 @@ Useful knobs in `bot.py`:
 - `XAI_BASE_URL`
 - `XAI_MODEL`
 - `XAI_TIMEOUT_SECONDS`
+- `CLOUD_FINAL_MAX_ATTEMPTS`
 - `SEARCH_QUERY_LIMIT`
 - `SEARCH_RESULTS_PER_QUERY`
 - `TOTAL_CANDIDATE_LIMIT`
@@ -372,6 +373,7 @@ Recent project updates include:
 - Increased search breadth to support up to two planned queries and up to 20 results per query.
 - Added a trimmed local-only evidence pool so local models do not have to process the entire broad pool.
 - Increased the local-model timeout to `600s`.
+- Added a retry for transient cloud final-synthesis failures, controlled by `CLOUD_FINAL_MAX_ATTEMPTS`.
 - Added per-stage timing and prompt-size diagnostics, visible in `/status`.
 - Added safer Telegram message chunking and transient timeout handling for status-message edits.
 - Added tests for search planning, Exa/Tavily fallback behavior, command routing, auto-search decisions, prompt metrics, and Telegram formatting.
