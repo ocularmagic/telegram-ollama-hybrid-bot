@@ -32,7 +32,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "ministral-3:8b").strip()
 LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "").strip()
-CLOUD_MODEL = os.getenv("CLOUD_MODEL", "kimi-k2.6:cloud")
+CLOUD_MODEL = os.getenv("CLOUD_MODEL", "kimi-k2.5:cloud")
 SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", LOCAL_MODEL_1)
 SEARCH_RETRIEVAL_MODEL = os.getenv("SEARCH_RETRIEVAL_MODEL", "tavily-search")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot_username")
