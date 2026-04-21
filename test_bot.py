@@ -94,18 +94,14 @@ class BotHelpersTest(unittest.TestCase):
 
     def test_usage_text_mentions_answer_commands(self):
         self.assertIn("/ask your question here", bot.ASK_USAGE)
-        self.assertIn("/asksearch your question here", bot.ASK_USAGE)
+        self.assertIn("/askmulti your question here", bot.ASK_USAGE)
         self.assertIn("/asknosearch your question here", bot.ASK_USAGE)
         self.assertNotIn("--no-search", bot.ASK_USAGE)
-        self.assertIn("/ask <question> - Auto-decide whether live search is needed.", bot.START_TEXT)
-        self.assertIn("/asksearch <question> - Force the full live-search workflow.", bot.START_TEXT)
-        self.assertIn("/asknosearch <question> - Force an answer without internet search.", bot.START_TEXT)
+        self.assertIn("/ask <question> - Search the web and answer with the single latest model.", bot.START_TEXT)
+        self.assertIn("/askmulti <question> - Search the web and use both models for the answer.", bot.START_TEXT)
+        self.assertIn("/asknosearch <question> - Answer without internet search using the single latest model.", bot.START_TEXT)
         self.assertIn("/image <prompt> - Generate an image locally with ComfyUI.", bot.START_TEXT)
-        self.assertIn("/fast <question> - Use live search, skip local review, and return a concise answer.", bot.START_TEXT)
-
-    def test_fast_usage_mentions_fast_command(self):
-        self.assertIn("/fast your question here", bot.FAST_USAGE)
-        self.assertIn("Costco", bot.FAST_USAGE)
+        self.assertNotIn("/fast <question>", bot.START_TEXT)
 
     def test_image_usage_mentions_image_command(self):
         self.assertIn("/image your image prompt here", bot.IMAGE_USAGE)
@@ -914,22 +910,22 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIn(f"LOCAL MODEL 1 ({bot.LOCAL_MODEL_1}) ANSWER:", prompt)
         self.assertNotIn("LOCAL MODEL 2", prompt)
 
-    def test_fast_final_system_prompt_prefers_concise_direct_answers(self):
-        self.assertIn("answer the user's question directly and concisely", bot.FAST_FINAL_SYSTEM_PROMPT)
-        self.assertIn("prioritize concrete, current, high-signal facts", bot.FAST_FINAL_SYSTEM_PROMPT)
-        self.assertIn("do not add long analysis", bot.FAST_FINAL_SYSTEM_PROMPT)
-        self.assertIn("cite the source inline for factual claims", bot.FAST_FINAL_SYSTEM_PROMPT)
-        self.assertIn("use measured confidence, not absolute certainty", bot.FAST_FINAL_SYSTEM_PROMPT)
+    def test_single_model_system_prompt_prefers_direct_grounded_answers(self):
+        self.assertIn("answer the user's question directly and clearly", bot.SINGLE_MODEL_SYSTEM_PROMPT)
+        self.assertIn("prioritize concrete, current, high-signal facts", bot.SINGLE_MODEL_SYSTEM_PROMPT)
+        self.assertIn("provide a thorough answer by default", bot.SINGLE_MODEL_SYSTEM_PROMPT)
+        self.assertIn("never invent citations, facts, or verification steps", bot.SINGLE_MODEL_SYSTEM_PROMPT)
+        self.assertIn("use measured confidence, not absolute certainty", bot.SINGLE_MODEL_SYSTEM_PROMPT)
 
-    def test_build_fast_prompt_requests_direct_live_answer(self):
-        prompt = bot.build_fast_prompt(
+    def test_build_single_model_prompt_requests_direct_answer(self):
+        prompt = bot.build_single_model_prompt(
             question="What time does Costco close today?",
             recent_chat_context="None",
             shared_pool="Store hours and location details.",
         )
 
-        self.assertIn("FAST ANSWER GOAL:", prompt)
-        self.assertIn("Use the live search pool to answer quickly and directly.", prompt)
+        self.assertIn("SINGLE MODEL ANSWER GOAL:", prompt)
+        self.assertIn("Answer directly from the shared context below.", prompt)
         self.assertIn("Store hours and location details.", prompt)
 
     def test_record_stage_duration_and_format_summary(self):
@@ -970,7 +966,7 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIn("shared_pool=120c/6l", text)
 
     def test_clear_chat_history_clears_last_timing(self):
-        bot.save_last_request_timing(123, "fast", 2.5, {"durations": {"final": 2.5}})
+        bot.save_last_request_timing(123, "single-search", 2.5, {"durations": {"final": 2.5}})
 
         bot.clear_chat_history(123)
 
@@ -986,6 +982,22 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         await bot.safe_edit_status_message(status_message, "new")
 
         self.assertEqual(status_message.edit_text.await_count, 1)
+
+    async def test_application_error_handler_downgrades_polling_network_errors(self):
+        update = MagicMock()
+        update.effective_message = None
+        context = MagicMock()
+        context.error = bot.NetworkError("Bad Gateway")
+
+        with patch.object(bot.logger, "warning") as mock_warning, patch.object(
+            bot.logger,
+            "error",
+        ) as mock_error, patch("bot.reply_text_in_chunks", new=AsyncMock()) as mock_reply:
+            await bot.application_error_handler(update, context)
+
+        self.assertEqual(mock_warning.call_count, 1)
+        self.assertEqual(mock_error.call_count, 0)
+        self.assertEqual(mock_reply.await_count, 0)
 
     async def test_run_ollama_step_retries_transient_errors(self):
         status_message = MagicMock()
@@ -1007,7 +1019,7 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
                 stage_state=stage_state,
                 stage_key="final",
                 stage_label="Asking cloud model.",
-                model_name="kimi-k2.5:cloud",
+                model_name="kimi-k2.6:cloud",
                 user_text="prompt",
                 system_prompt="system",
                 timeout_seconds=10,
@@ -1058,82 +1070,43 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         status_text = mock_reply.await_args.args[1]
         self.assertIn("Available commands:", status_text)
         self.assertIn("/ask <question>", status_text)
-        self.assertIn("/asksearch <question>", status_text)
+        self.assertIn("/askmulti <question>", status_text)
         self.assertIn("/asknosearch <question>", status_text)
         self.assertIn("/image <prompt>", status_text)
         self.assertIn("/grok <question>", status_text)
         self.assertIn("/groksearch <question>", status_text)
-        self.assertIn("/fast <question>", status_text)
+        self.assertNotIn("/fast <question>", status_text)
 
-    async def test_handle_ask_request_prompts_when_search_decision_is_unclear(self):
+    async def test_handle_ask_request_defaults_to_single_model_search(self):
         update = MagicMock()
         update.message = MagicMock()
         update.effective_chat.id = 123
         context = MagicMock()
         context.args = ["When", "was", "Gemini", "2.5", "Flash", "released?"]
-        context.chat_data = {}
 
-        with patch("bot.reply_text_in_chunks", new=AsyncMock()) as mock_reply, patch(
+        with patch(
             "bot.execute_question_request",
             new=AsyncMock(),
         ) as mock_execute:
-            await bot.handle_ask_request(update, context, search_policy="auto")
+            await bot.handle_ask_request(update, context)
 
-        self.assertIn(bot.PENDING_SEARCH_DECISION_KEY, context.chat_data)
-        self.assertEqual(mock_execute.await_count, 0)
-        self.assertEqual(mock_reply.await_count, 1)
-
-    async def test_pending_search_decision_reply_runs_saved_question(self):
-        update = MagicMock()
-        update.effective_message = MagicMock()
-        update.effective_message.text = "yes"
-        context = MagicMock()
-        context.chat_data = {
-            bot.PENDING_SEARCH_DECISION_KEY: {
-                "question": "When was Gemini 2.5 Flash released?"
-            }
-        }
-
-        with patch("bot.execute_question_request", new=AsyncMock()) as mock_execute:
-            await bot.pending_search_decision_reply(update, context)
-
-        self.assertNotIn(bot.PENDING_SEARCH_DECISION_KEY, context.chat_data)
         self.assertEqual(mock_execute.await_count, 1)
         self.assertFalse(mock_execute.await_args.kwargs["force_no_search"])
+        self.assertFalse(mock_execute.await_args.kwargs["multi_model"])
 
-    async def test_handle_ask_request_auto_search_adds_post_answer_note(self):
+    async def test_handle_ask_request_can_use_multi_model_path(self):
         update = MagicMock()
         update.message = MagicMock()
         update.effective_chat.id = 123
         context = MagicMock()
-        context.args = ["What", "are", "the", "top", "5", "news", "headlines", "today?"]
-        context.chat_data = {}
+        context.args = ["Compare", "current", "best", "hybrid", "SUVs"]
 
         with patch("bot.execute_question_request", new=AsyncMock()) as mock_execute:
-            await bot.handle_ask_request(update, context, search_policy="auto")
+            await bot.handle_ask_request(update, context, multi_model=True)
 
         self.assertEqual(mock_execute.await_count, 1)
-        self.assertEqual(
-            mock_execute.await_args.kwargs["post_answer_note"],
-            "Search used: yes (auto-decided).",
-        )
-
-    async def test_handle_ask_request_auto_no_search_adds_post_answer_note(self):
-        update = MagicMock()
-        update.message = MagicMock()
-        update.effective_chat.id = 123
-        context = MagicMock()
-        context.args = ["Explain", "TLS", "handshakes."]
-        context.chat_data = {}
-
-        with patch("bot.execute_question_request", new=AsyncMock()) as mock_execute:
-            await bot.handle_ask_request(update, context, search_policy="auto")
-
-        self.assertEqual(mock_execute.await_count, 1)
-        self.assertEqual(
-            mock_execute.await_args.kwargs["post_answer_note"],
-            "Search used: no (auto-decided).",
-        )
+        self.assertFalse(mock_execute.await_args.kwargs["force_no_search"])
+        self.assertTrue(mock_execute.await_args.kwargs["multi_model"])
 
     async def test_execute_question_request_builds_recent_chat_context(self):
         chat_id = 987654
@@ -1149,7 +1122,7 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         context = MagicMock()
 
         with patch(
-            "bot.orchestrate_answer",
+            "bot.orchestrate_single_model_answer",
             new=AsyncMock(return_value=("final answer", [], None)),
         ) as mock_orchestrate, patch(
             "bot.send_formatted_answer",
@@ -1169,7 +1142,19 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
             await bot.ask_no_search_command(update, context)
 
         self.assertEqual(mock_handle.await_count, 1)
-        self.assertEqual(mock_handle.await_args.kwargs["search_policy"], "force_no_search")
+        self.assertTrue(mock_handle.await_args.kwargs["force_no_search"])
+        self.assertFalse(mock_handle.await_args.kwargs["multi_model"])
+
+    async def test_ask_multi_command_uses_multi_model_path(self):
+        update = MagicMock()
+        context = MagicMock()
+
+        with patch("bot.handle_ask_request", new=AsyncMock()) as mock_handle:
+            await bot.ask_multi_command(update, context)
+
+        self.assertEqual(mock_handle.await_count, 1)
+        self.assertFalse(mock_handle.await_args.kwargs["force_no_search"])
+        self.assertTrue(mock_handle.await_args.kwargs["multi_model"])
 
     async def test_image_command_sends_all_generated_photos(self):
         update = MagicMock()

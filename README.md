@@ -1,6 +1,6 @@
 # Telegram Hybrid Research Bot with Ollama + Exa/Tavily
 
-A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a practical workflow, with an auto-deciding default mode and explicit live-search commands.
+A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a practical workflow, with explicit single-model and multi-model answer modes.
 
 This repo is for builders who want to learn how a hybrid local + cloud system behaves in the real world, not just how to call one model once.
 
@@ -8,15 +8,14 @@ This repo is for builders who want to learn how a hybrid local + cloud system be
 
 The bot has three main answer paths:
 
-- `/ask ...` auto-decides whether live search is needed.
-- `/asksearch ...` always uses the full live-search workflow.
-- `/asknosearch ...` always skips internet search.
+- `/ask ...` always performs live search and answers with the single latest cloud model.
+- `/askmulti ...` always performs live search and uses both the local model and the cloud model.
+- `/asknosearch ...` skips internet search and answers with the single latest cloud model.
 - `/image ...` generates an image locally through a ComfyUI workflow.
 - `/grok ...` uses xAI Grok without search tools for testing a flagship LLM path.
 - `/groksearch ...` uses xAI Grok with the web search tool array enabled for testing a flagship LLM path.
-- `/fast ...` always uses live search, but skips the local-model review step.
 
-When a request uses the full live-search workflow, the bot:
+When a request uses the multi-model live-search workflow, the bot:
 
 1. Uses a **local planner model** to generate multiple search angles.
 2. Uses **Exa or Tavily live web search** to collect a broad shared candidate pool.
@@ -25,9 +24,11 @@ When a request uses the full live-search workflow, the bot:
 5. Sends the broad evidence pool plus the local answer to **one cloud model**.
 6. Returns a final answer with staged progress updates in Telegram.
 
-When a user runs `/ask ...`, the bot searches automatically for clearly current, comparative, sourced, or high-stakes questions; skips search for clearly evergreen explanations; and asks for a yes/no confirmation when the request is ambiguous. When it auto-decides without asking, it sends a short note under the answer saying whether search was used.
+When a user runs `/ask ...`, the bot plans search queries, gathers evidence, and sends the shared search context straight to the latest cloud model for a single-model answer.
 
-When a user runs `/fast ...`, the bot keeps live search, skips the local-model review step, and asks Kimi for a concise answer.
+When a user runs `/askmulti ...`, the bot runs the broader two-model pipeline: local model review first, then cloud synthesis.
+
+When a user runs `/asknosearch ...`, the bot skips web retrieval entirely and asks the latest cloud model to answer from general model knowledge.
 
 By default, the repo is configured as:
 
@@ -37,7 +38,7 @@ By default, the repo is configured as:
 - **Local model 2:** disabled
 - **Image generation:** local ComfyUI workflow, configured with `COMFYUI_WORKFLOW_PATH`
 - **Grok commands:** `grok-4.20-multi-agent-0309` through xAI Responses API for testing a flagship LLM path
-- **Final synthesis:** `kimi-k2.5:cloud`
+- **Final synthesis / single-model answers:** `kimi-k2.6:cloud`
 
 ## Why this project is useful
 
@@ -55,9 +56,7 @@ This is a good learning repo if you want hands-on experience with:
 ```text
 Telegram
   |
-Command-only bot (/ask, /asksearch, /asknosearch, /image, /grok, /groksearch, /fast, /status, /clear)
-  |
-Auto search decision (/ask only)
+Command-only bot (/ask, /askmulti, /asknosearch, /image, /grok, /groksearch, /status, /clear)
   |
 Local search planner model
   |
@@ -69,12 +68,12 @@ ministral-3:8b
   |
 Local answer
   |
-kimi-k2.5:cloud
+kimi-k2.6:cloud
   |
 Final synthesis
 ```
 
-For `/ask` questions that are auto-decided as no-search, the retrieval stage is replaced by a no-search context block and the bot still uses the local model plus Kimi for final synthesis. For `/fast`, the bot uses live retrieval plus Kimi and skips the local review step.
+For `/ask`, the local-review stage is skipped and the shared search pool goes directly to Kimi K2.6. For `/asknosearch`, the retrieval stage is replaced by a no-search context block and Kimi K2.6 answers directly from model knowledge. For `/askmulti`, the full local-plus-cloud synthesis path is used.
 
 ## Requirements
 
@@ -84,11 +83,25 @@ For `/ask` questions that are auto-decided as no-search, the retrieval stage is 
 - An Exa API key or Tavily API key
 - Enough local hardware to run your chosen local model
 
-If you keep the default final model as `kimi-k2.5:cloud`, sign in locally with:
+If you keep the default cloud model as `kimi-k2.6:cloud`, sign in locally with:
 
 ```bash
 ollama signin
 ```
+
+To verify that your local Ollama session can access the cloud model, run either:
+
+```bash
+ollama pull kimi-k2.6:cloud
+```
+
+or:
+
+```bash
+ollama run kimi-k2.6:cloud
+```
+
+If that succeeds, the bot should be able to use `kimi-k2.6:cloud` through your local Ollama installation.
 
 ## Quick start
 
@@ -173,25 +186,13 @@ Shows a short help message.
 Shows model assignments, timeout settings, search-pool limits, memory status, recent Exa/Tavily usage, and the most recent request timing/prompt-size metrics.
 
 ### `/ask your question`
-Auto-decides whether live search is needed. If the bot is unsure, it asks you to reply `yes` or `no`.
+Runs live search and sends the shared search context directly to the latest cloud model, currently `kimi-k2.6:cloud`.
 
-If `/ask` auto-decides without asking, the bot adds a note below the answer:
-
-```text
-Search used: yes (auto-decided).
-```
-
-or:
-
-```text
-Search used: no (auto-decided).
-```
-
-### `/asksearch your question`
-Runs the full hybrid workflow with live search.
+### `/askmulti your question`
+Runs the full hybrid workflow with live search, local-model review, and final cloud synthesis.
 
 ### `/asknosearch your question`
-Forces an answer without internet search.
+Skips internet search and sends the question plus recent chat context directly to the latest cloud model, currently `kimi-k2.6:cloud`.
 
 ### `/image your image prompt`
 Queues the prompt in your local ComfyUI workflow and sends all generated output images back to Telegram.
@@ -202,9 +203,6 @@ Sends the prompt directly to xAI using `grok-4.20-multi-agent-0309` without sear
 ### `/groksearch your question`
 Sends the prompt directly to xAI using `grok-4.20-multi-agent-0309` as a standalone flagship LLM test path and includes `tools: [{"type": "web_search"}]` on every request. It only includes previous `/grok` and `/groksearch` turns as Grok-only context; the response is returned directly to Telegram.
 
-### `/fast your question`
-Runs live search, skips the local-model review step, and returns a concise answer.
-
 ### `/clear`
 Clears rolling memory for the current Telegram chat.
 
@@ -213,8 +211,8 @@ Clears rolling memory for the current Telegram chat.
 Recommended pattern in group chats:
 
 ```text
-/asksearch@your_bot_username what are the top 5 news stories from the last 72 hours?
-/fast@your_bot_username what are the hours for Pike Place Chowder today?
+/ask@your_bot_username what are the top 5 news stories from the last 72 hours?
+/askmulti@your_bot_username compare the best midsize trucks on the market right now
 /ask@your_bot_username explain TCP vs UDP
 /asknosearch@your_bot_username explain TCP vs UDP from general knowledge
 /image@your_bot_username a photorealistic orange tabby cat wearing tiny aviator goggles
@@ -231,8 +229,8 @@ The bot stores a short rolling history per Telegram chat so follow-up questions 
 Example:
 
 ```text
-/asksearch what are the top 5 market stories this week?
-/fast what time does Costco close today?
+/ask what are the top 5 market stories this week?
+/ask what time does Costco close today?
 /ask give me more detail on the gold-price story you mentioned
 /asknosearch explain the last answer without internet search
 ```
@@ -252,8 +250,8 @@ This repo uses a **shared-evidence** design:
 
 That makes it easier to compare model behavior without introducing too many moving parts at once.
 
-If you intentionally want to bypass that retrieval layer, use `/asknosearch` or add "without internet search" to `/ask`.
-If you want live data without the full multi-model analysis, use `/fast`.
+If you intentionally want to bypass that retrieval layer, use `/asknosearch`.
+If you want live data without the full multi-model analysis, use `/ask`.
 
 ### ComfyUI Image Setup
 
@@ -345,14 +343,13 @@ It also keeps daily search stats on disk so `/status` can show recent Exa/Tavily
 
 ### Current command behavior
 
-- `/ask` is the normal default. It decides whether search is needed, asks for clarification when ambiguous, and reports whether search was used when it chooses automatically.
-- `/asksearch` bypasses that decision and always runs the full search workflow.
-- `/asknosearch` bypasses that decision and always skips internet search.
+- `/ask` always searches and answers with the single latest cloud model.
+- `/askmulti` always searches and uses both the local model and the cloud model.
+- `/asknosearch` always skips internet search and answers with the single latest cloud model.
 - `/image` calls the local ComfyUI API, queues the configured workflow, fetches all generated images from ComfyUI history, and sends them back to Telegram.
 - `/grok` calls xAI's Responses API without tools as a flagship LLM test path, includes only Grok-command history as context, and returns the response directly to Telegram.
 - `/groksearch` calls xAI's Responses API with the `web_search` tool included in the `tools` array every time as a flagship LLM test path, includes only Grok-command history as context, and returns the response directly to Telegram.
-- `/fast` always searches, skips the local model review, and asks Kimi for a shorter answer.
-- `/clear` clears rolling chat memory and any pending `/ask` search decision for the chat.
+- `/clear` clears rolling chat memory for the chat.
 
 ## Changes Made
 
@@ -360,14 +357,13 @@ Recent project updates include:
 
 - Switched from two local review models to one default local model: `ministral-3:8b`.
 - Disabled `LOCAL_MODEL_2` by default while keeping the second local slot optional in code.
-- Changed `/ask` from a no-search command into an auto-search command.
-- Added `/asksearch` as the explicit full live-search command.
-- Reintroduced `/asknosearch` as an explicit forced no-search command.
+- Changed `/ask` into the explicit single-model live-search command using the latest cloud model.
+- Added `/askmulti` as the explicit multi-model live-search command.
+- Kept `/asknosearch` as the explicit forced no-search command using the latest cloud model.
 - Added `/image` for local ComfyUI image generation using a configurable API-format workflow.
 - Added `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX` so the bot can wrap Telegram image prompts with fixed style text.
 - Added `/grok` and `/groksearch` for testing a flagship xAI LLM path, with `/groksearch` sending the web search tool array on every request.
-- Added yes/no follow-up handling when `/ask` is unsure whether live search is needed.
-- Added the post-answer `Search used: yes/no (auto-decided).` note for silent `/ask` decisions.
+- Switched the default cloud model to `kimi-k2.6:cloud`.
 - Added Exa as the primary retrieval provider, using the official `exa-py` SDK.
 - Kept Tavily as fallback behind Exa and Ollama web search as an optional fallback.
 - Increased search breadth to support up to two planned queries and up to 20 results per query.
@@ -376,7 +372,7 @@ Recent project updates include:
 - Added a retry for transient cloud final-synthesis failures, controlled by `CLOUD_FINAL_MAX_ATTEMPTS`.
 - Added per-stage timing and prompt-size diagnostics, visible in `/status`.
 - Added safer Telegram message chunking and transient timeout handling for status-message edits.
-- Added tests for search planning, Exa/Tavily fallback behavior, command routing, auto-search decisions, prompt metrics, and Telegram formatting.
+- Added tests for search planning, Exa/Tavily fallback behavior, command routing, prompt metrics, and Telegram formatting.
 
 ### Timeouts are intentionally generous
 
