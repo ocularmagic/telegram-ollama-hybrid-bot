@@ -14,8 +14,8 @@ import urllib.error
 from datetime import datetime, timedelta
 
 from telegram import Update
-from telegram.error import BadRequest, TimedOut
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from ollama import chat
 from dotenv import load_dotenv
 
@@ -32,7 +32,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "ministral-3:8b").strip()
 LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "").strip()
-CLOUD_MODEL = os.getenv("CLOUD_MODEL", "kimi-k2.5:cloud")
+CLOUD_MODEL = os.getenv("CLOUD_MODEL", "kimi-k2.6:cloud")
 SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", LOCAL_MODEL_1)
 SEARCH_RETRIEVAL_MODEL = os.getenv("SEARCH_RETRIEVAL_MODEL", "tavily-search")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot_username")
@@ -159,22 +159,22 @@ Rules:
 Output only the final user-facing answer.
 """
 
-FAST_FINAL_SYSTEM_PROMPT = """You are a precise, high-trust AI assistant producing a fast answer.
+SINGLE_MODEL_SYSTEM_PROMPT = """You are a precise, high-trust AI assistant producing the user-facing answer.
 
 You will receive:
 - the user's current question
 - recent chat context from this Telegram chat
-- a broad shared search pool gathered from live web retrieval
+- a shared context block, which may come from live web retrieval or from the no-search knowledge path
 
 Your job:
-- answer the user's question directly and concisely
-- prioritize concrete, current, high-signal facts from the shared pool
-- for operational questions like hours, menu items, prices, addresses, availability, or contact details, lead with the exact answer the user likely wants
-- cite the source inline for factual claims from the shared pool using a short form such as "(Source: example.com)"
-- mention uncertainty briefly if the search pool is ambiguous, stale, or conflicting
-- say what would verify the answer if the evidence is incomplete or conflicting
+- answer the user's question directly and clearly
+- use the shared context block directly rather than referring to internal steps
+- when the context comes from live search, prioritize concrete, current, high-signal facts and cite factual claims inline using a short form such as "(Source: example.com)"
+- when the evidence is incomplete, mixed, or stale, say so plainly
+- provide a thorough answer by default unless the user asks for something brief
+- add helpful explanation, caveats, or practical next steps when they improve understanding
+- for operational questions like hours, menu items, prices, addresses, availability, or contact details, lead with the exact answer the user most likely wants
 - never invent citations, facts, or verification steps
-- do not add long analysis, local-model summaries, or unnecessary background
 - do not mention internal implementation details
 - use measured confidence, not absolute certainty
 
@@ -185,38 +185,30 @@ AVAILABLE_COMMANDS_TEXT = (
     "Available commands:\n"
     "/start - Show this help summary.\n"
     "/status - Show config, limits, recent timings, usage, and this command list.\n"
-    "/ask <question> - Auto-decide whether live search is needed.\n"
-    "/asksearch <question> - Force the full live-search workflow.\n"
-    "/asknosearch <question> - Force an answer without internet search.\n"
+    "/ask <question> - Search the web and answer with the single latest model.\n"
+    "/askmulti <question> - Search the web and use both models for the answer.\n"
+    "/asknosearch <question> - Answer without internet search using the single latest model.\n"
     "/image <prompt> - Generate an image locally with ComfyUI.\n"
     "/grok <question> - Ask Grok without search tools.\n"
     "/groksearch <question> - Ask Grok with xAI web search tools enabled.\n"
-    "/fast <question> - Use live search, skip local review, and return a concise answer.\n"
-    "/clear - Clear this chat's rolling memory and pending search decision."
+    "/clear - Clear this chat's rolling memory."
 )
 
 START_TEXT = (
     "Bot is working.\n\n"
     f"{AVAILABLE_COMMANDS_TEXT}\n\n"
-    f"In groups, use /ask@{BOT_USERNAME}, /asksearch@{BOT_USERNAME}, or /asknosearch@{BOT_USERNAME}."
+    f"In groups, use /ask@{BOT_USERNAME}, /askmulti@{BOT_USERNAME}, or /asknosearch@{BOT_USERNAME}."
 )
 
 ASK_USAGE = (
     "Usage:\n"
     "/ask your question here\n"
-    "/asksearch your question here\n\n"
+    "/askmulti your question here\n\n"
     "/asknosearch your question here\n\n"
     "Example:\n"
-    "/ask explain TLS handshakes\n"
-    "/asksearch what are the top 5 news headlines from the last 72 hours?\n"
+    "/ask what are the top 5 news headlines from the last 72 hours?\n"
+    "/askmulti compare the best midsize trucks on the market right now\n"
     "/asknosearch explain TCP vs UDP from general knowledge"
-)
-
-FAST_USAGE = (
-    "Usage:\n"
-    "/fast your question here\n\n"
-    "Example:\n"
-    "/fast what are the hours for Costco in Seattle today?"
 )
 
 IMAGE_USAGE = (
@@ -2199,7 +2191,7 @@ BROAD SHARED SEARCH POOL:
 """
 
 
-def build_fast_prompt(question: str, recent_chat_context: str, shared_pool: str) -> str:
+def build_single_model_prompt(question: str, recent_chat_context: str, shared_pool: str) -> str:
     current_date_context = build_current_date_context()
     return f"""{current_date_context}
 
@@ -2209,10 +2201,10 @@ RECENT CHAT CONTEXT:
 CURRENT USER QUESTION:
 {question}
 
-FAST ANSWER GOAL:
-Use the live search pool to answer quickly and directly. Prefer the specific operational detail the user is likely asking for over broad analysis.
+SINGLE MODEL ANSWER GOAL:
+Answer directly from the shared context below. If the context is from live search, use it as the primary grounding. If the context is from the no-search path, answer from general model knowledge and note uncertainty when helpful.
 
-BROAD SHARED SEARCH POOL:
+SHARED CONTEXT BLOCK:
 {shared_pool}
 """
 
@@ -2250,12 +2242,12 @@ def build_fallback_answer(
     return "\n\n".join(sections)
 
 
-def build_fast_fallback_answer(question: str, shared_pool: str, final_error: str) -> str:
+def build_single_model_fallback_answer(question: str, shared_pool: str, final_error: str) -> str:
     return (
-        "I could not complete the fast cloud answer step.\n"
+        "I could not complete the single-model answer step.\n"
         f"Cloud error: {final_error}\n\n"
         f"Question:\n{question}\n\n"
-        "Live search pool:\n"
+        "Shared context block:\n"
         f"{shared_pool}"
     )
 
@@ -2319,7 +2311,7 @@ def format_prompt_metrics_summary(stage_state: dict) -> str:
         "local_shared_pool",
         "local_prompt",
         "final_prompt",
-        "fast_prompt",
+        "single_prompt",
         "local_answer_1",
         "local_answer_2",
     ]
@@ -2949,13 +2941,18 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
         )
 
 
-async def orchestrate_fast_answer(question: str, recent_chat_context: str, status_message):
+async def orchestrate_single_model_answer(
+    question: str,
+    recent_chat_context: str,
+    status_message,
+    force_no_search: bool = False,
+):
     stage_state = {
         "stage": "starting",
         "started_at": time.monotonic(),
         "completed_stages": set(),
         "skipped_stages": {"local_model_1", "local_model_2"},
-        "detail": "Request received. Preparing fast live-search answer.",
+        "detail": "Request received. Preparing single-model answer.",
     }
     stop_event = asyncio.Event()
     heartbeat_task = asyncio.create_task(progress_heartbeat(status_message, stage_state, stop_event))
@@ -2966,35 +2963,35 @@ async def orchestrate_fast_answer(question: str, recent_chat_context: str, statu
             recent_chat_context=recent_chat_context,
             status_message=status_message,
             stage_state=stage_state,
-            allow_no_search=False,
-            force_no_search=False,
+            allow_no_search=force_no_search,
+            force_no_search=force_no_search,
         )
         record_prompt_metrics(stage_state, "shared_pool", shared_pool)
 
-        fast_prompt = build_fast_prompt(question, recent_chat_context, shared_pool)
-        record_prompt_metrics(stage_state, "fast_prompt", fast_prompt)
+        single_prompt = build_single_model_prompt(question, recent_chat_context, shared_pool)
+        record_prompt_metrics(stage_state, "single_prompt", single_prompt)
         logger.info(
-            "Prompt metrics | mode=fast shared_pool=%sc fast_prompt=%sc",
+            "Prompt metrics | mode=single shared_pool=%sc single_prompt=%sc",
             len(shared_pool or ""),
-            len(fast_prompt or ""),
+            len(single_prompt or ""),
         )
-        stage_state["detail"] = "Skipping local model debate for a concise fast answer."
+        stage_state["detail"] = "Using the latest single model without local model debate."
 
         final_answer, final_error = await run_ollama_step(
             status_message=status_message,
             stage_state=stage_state,
             stage_key="final",
-            stage_label=f"Asking {CLOUD_MODEL} for a concise fast answer.",
+            stage_label=f"Asking {CLOUD_MODEL} for the single-model answer.",
             model_name=CLOUD_MODEL,
-            user_text=fast_prompt,
-            system_prompt=FAST_FINAL_SYSTEM_PROMPT,
+            user_text=single_prompt,
+            system_prompt=SINGLE_MODEL_SYSTEM_PROMPT,
             timeout_seconds=FINAL_TIMEOUT_SECONDS,
             max_attempts=CLOUD_FINAL_MAX_ATTEMPTS,
         )
 
         if final_error:
-            logger.warning("Fast cloud answer failed, building fallback answer: %s", final_error)
-            final_answer = build_fast_fallback_answer(
+            logger.warning("Single-model cloud answer failed, building fallback answer: %s", final_error)
+            final_answer = build_single_model_fallback_answer(
                 question=question,
                 shared_pool=shared_pool,
                 final_error=final_error,
@@ -3010,7 +3007,7 @@ async def orchestrate_fast_answer(question: str, recent_chat_context: str, statu
         await heartbeat_task
         total_elapsed = time.monotonic() - stage_state["started_at"]
         logger.info(
-            "Request timing | mode=fast total=%.2fs | %s | prompts=%s",
+            "Request timing | mode=single total=%.2fs | %s | prompts=%s",
             total_elapsed,
             format_stage_timing_summary(stage_state),
             format_prompt_metrics_summary(stage_state),
@@ -3057,7 +3054,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     clear_chat_history(chat_id)
-    context.chat_data.pop(PENDING_SEARCH_DECISION_KEY, None)
     await reply_text_in_chunks(update.message, "Cleared this chat's rolling memory.")
 
 
@@ -3066,8 +3062,7 @@ async def execute_question_request(
     context: ContextTypes.DEFAULT_TYPE,
     user_text: str,
     force_no_search: bool = False,
-    fast_mode: bool = False,
-    post_answer_note: str | None = None,
+    multi_model: bool = False,
 ) -> None:
     chat_id = update.effective_chat.id
     recent_chat_context = format_recent_chat_context(chat_id)
@@ -3086,14 +3081,15 @@ async def execute_question_request(
 
     async with chat_lock:
         try:
-            if fast_mode:
-                answer, notices, stage_state = await orchestrate_fast_answer(
+            if multi_model:
+                answer, notices, stage_state = await orchestrate_answer(
                     user_text,
                     recent_chat_context,
                     status_message,
+                    force_no_search=False,
                 )
             else:
-                answer, notices, stage_state = await orchestrate_answer(
+                answer, notices, stage_state = await orchestrate_single_model_answer(
                     user_text,
                     recent_chat_context,
                     status_message,
@@ -3114,21 +3110,19 @@ async def execute_question_request(
             total_elapsed = time.monotonic() - stage_state["started_at"]
             save_last_request_timing(
                 chat_id,
-                "fast" if fast_mode else "full",
+                "multi" if multi_model else ("single-no-search" if force_no_search else "single-search"),
                 total_elapsed,
                 stage_state,
             )
         save_chat_turn(chat_id, user_text, answer)
         await send_formatted_answer(update, answer)
-        if post_answer_note:
-            await reply_text_in_chunks(update.message, post_answer_note)
 
 
 async def handle_ask_request(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    search_policy: str = "auto",
-    fast_mode: bool = False,
+    force_no_search: bool = False,
+    multi_model: bool = False,
     usage_text: str = ASK_USAGE,
 ) -> None:
     user_text = normalize_whitespace(" ".join(context.args))
@@ -3137,72 +3131,25 @@ async def handle_ask_request(
         await reply_text_in_chunks(update.message, usage_text)
         return
 
-    context.chat_data.pop(PENDING_SEARCH_DECISION_KEY, None)
-
-    if fast_mode:
-        await execute_question_request(update, context, user_text, fast_mode=True)
-        return
-
-    if search_policy == "force_search":
-        await execute_question_request(update, context, user_text, force_no_search=False)
-        return
-
-    if search_policy == "force_no_search":
-        await execute_question_request(update, context, user_text, force_no_search=True)
-        return
-
-    chat_id = update.effective_chat.id
-    recent_chat_context = format_recent_chat_context(chat_id)
-    search_decision = decide_search_behavior(user_text, recent_chat_context)
-    decision = search_decision.get("decision", SEARCH_DECISION_SKIP_SEARCH)
-
-    if decision == SEARCH_DECISION_USE_SEARCH:
-        await execute_question_request(
-            update,
-            context,
-            user_text,
-            force_no_search=False,
-            post_answer_note="Search used: yes (auto-decided).",
-        )
-        return
-
-    if decision == SEARCH_DECISION_SKIP_SEARCH:
-        await execute_question_request(
-            update,
-            context,
-            user_text,
-            force_no_search=True,
-            post_answer_note="Search used: no (auto-decided).",
-        )
-        return
-
-    context.chat_data[PENDING_SEARCH_DECISION_KEY] = {
-        "question": user_text,
-        "created_at": int(time.time()),
-        "reason": search_decision.get("reason", ""),
-    }
-    await reply_text_in_chunks(
-        update.message,
-        "I’m not sure whether this question needs live web search.\n"
-        f"Reason: {search_decision.get('reason', 'The request could reasonably go either way.')}\n\n"
-        "Reply with `yes` to use live search or `no` to answer from model knowledge only."
+    await execute_question_request(
+        update,
+        context,
+        user_text,
+        force_no_search=force_no_search,
+        multi_model=multi_model,
     )
 
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle_ask_request(update, context, search_policy="auto")
+    await handle_ask_request(update, context, force_no_search=False, multi_model=False)
 
 
-async def ask_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle_ask_request(update, context, search_policy="force_search")
+async def ask_multi_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_ask_request(update, context, force_no_search=False, multi_model=True)
 
 
 async def ask_no_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle_ask_request(update, context, search_policy="force_no_search")
-
-
-async def fast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle_ask_request(update, context, fast_mode=True, usage_text=FAST_USAGE)
+    await handle_ask_request(update, context, force_no_search=True, multi_model=False)
 
 
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3327,38 +3274,19 @@ async def grok_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await handle_grok_request(update, context, use_search=True)
 
 
-async def pending_search_decision_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pending = context.chat_data.get(PENDING_SEARCH_DECISION_KEY)
-    message = getattr(update, "effective_message", None)
-    if not pending or message is None:
-        return
-
-    decision = parse_yes_no_reply(message.text or "")
-    if decision is None:
-        await reply_text_in_chunks(
-            message,
-            "I still have a pending `/ask` search decision for your last question. Reply `yes` to use live search or `no` to answer without it."
-        )
-        return
-
-    question = pending.get("question", "")
-    context.chat_data.pop(PENDING_SEARCH_DECISION_KEY, None)
-    await execute_question_request(
-        update,
-        context,
-        question,
-        force_no_search=(decision == SEARCH_DECISION_SKIP_SEARCH),
-    )
-
-
 async def application_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     error = getattr(context, "error", None)
+    message = getattr(update, "effective_message", None)
+
+    if isinstance(error, NetworkError) and message is None:
+        logger.warning("Transient Telegram polling/network error: %s", error)
+        return
+
     exc_info = None
     if error is not None:
         exc_info = (type(error), error, error.__traceback__)
     logger.error("Unhandled application error: %s", error, exc_info=exc_info)
 
-    message = getattr(update, "effective_message", None)
     if message is None:
         return
 
@@ -3385,13 +3313,11 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("ask", ask_command))
-    app.add_handler(CommandHandler("asksearch", ask_search_command))
+    app.add_handler(CommandHandler("askmulti", ask_multi_command))
     app.add_handler(CommandHandler("asknosearch", ask_no_search_command))
     app.add_handler(CommandHandler("image", image_command))
     app.add_handler(CommandHandler("grok", grok_command))
     app.add_handler(CommandHandler("groksearch", grok_search_command))
-    app.add_handler(CommandHandler("fast", fast_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pending_search_decision_reply))
     app.add_error_handler(application_error_handler)
 
     print("Bot is running. Press Ctrl+C to stop.")
