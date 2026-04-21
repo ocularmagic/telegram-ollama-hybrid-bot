@@ -38,7 +38,7 @@ By default, the repo is configured as:
 - **Local model 2:** disabled
 - **Image generation:** local ComfyUI workflow, configured with `COMFYUI_WORKFLOW_PATH`
 - **Grok commands:** `grok-4.20-multi-agent-0309` through xAI Responses API for testing a flagship LLM path
-- **Final synthesis / single-model answers:** `kimi-k2.6:cloud`
+- **Final synthesis / single-model answers:** `kimi-k2.5:cloud`
 
 ## Why this project is useful
 
@@ -68,12 +68,12 @@ ministral-3:8b
   |
 Local answer
   |
-kimi-k2.6:cloud
+kimi-k2.5:cloud
   |
 Final synthesis
 ```
 
-For `/ask`, the local-review stage is skipped and the shared search pool goes directly to Kimi K2.6. For `/asknosearch`, the retrieval stage is replaced by a no-search context block and Kimi K2.6 answers directly from model knowledge. For `/askmulti`, the full local-plus-cloud synthesis path is used.
+For `/ask`, the local-review stage is skipped and the shared search pool goes directly to Kimi K2.5. For `/asknosearch`, the retrieval stage is replaced by a no-search context block and Kimi K2.5 answers directly from model knowledge. For `/askmulti`, the full local-plus-cloud synthesis path is used.
 
 ## Requirements
 
@@ -83,7 +83,7 @@ For `/ask`, the local-review stage is skipped and the shared search pool goes di
 - An Exa API key or Tavily API key
 - Enough local hardware to run your chosen local model
 
-If you keep the default cloud model as `kimi-k2.6:cloud`, sign in locally with:
+If you keep the default cloud model as `kimi-k2.5:cloud`, sign in locally with:
 
 ```bash
 ollama signin
@@ -92,16 +92,16 @@ ollama signin
 To verify that your local Ollama session can access the cloud model, run either:
 
 ```bash
-ollama pull kimi-k2.6:cloud
+ollama pull kimi-k2.5:cloud
 ```
 
 or:
 
 ```bash
-ollama run kimi-k2.6:cloud
+ollama run kimi-k2.5:cloud
 ```
 
-If that succeeds, the bot should be able to use `kimi-k2.6:cloud` through your local Ollama installation.
+If that succeeds, the bot should be able to use `kimi-k2.5:cloud` through your local Ollama installation.
 
 ## Quick start
 
@@ -186,13 +186,13 @@ Shows a short help message.
 Shows model assignments, timeout settings, search-pool limits, memory status, recent Exa/Tavily usage, and the most recent request timing/prompt-size metrics.
 
 ### `/ask your question`
-Runs live search and sends the shared search context directly to the latest cloud model, currently `kimi-k2.6:cloud`.
+Runs live search and sends the shared search context directly to the latest cloud model, currently `kimi-k2.5:cloud`.
 
 ### `/askmulti your question`
 Runs the full hybrid workflow with live search, local-model review, and final cloud synthesis.
 
 ### `/asknosearch your question`
-Skips internet search and sends the question plus recent chat context directly to the latest cloud model, currently `kimi-k2.6:cloud`.
+Skips internet search and sends the question plus recent chat context directly to the latest cloud model, currently `kimi-k2.5:cloud`.
 
 ### `/image your image prompt`
 Queues the prompt in your local ComfyUI workflow and sends all generated output images back to Telegram.
@@ -363,7 +363,7 @@ Recent project updates include:
 - Added `/image` for local ComfyUI image generation using a configurable API-format workflow.
 - Added `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX` so the bot can wrap Telegram image prompts with fixed style text.
 - Added `/grok` and `/groksearch` for testing a flagship xAI LLM path, with `/groksearch` sending the web search tool array on every request.
-- Switched the default cloud model to `kimi-k2.6:cloud`.
+- Switched the default cloud model back to `kimi-k2.5:cloud`.
 - Added Exa as the primary retrieval provider, using the official `exa-py` SDK.
 - Kept Tavily as fallback behind Exa and Ollama web search as an optional fallback.
 - Increased search breadth to support up to two planned queries and up to 20 results per query.

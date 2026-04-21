@@ -1019,7 +1019,7 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
                 stage_state=stage_state,
                 stage_key="final",
                 stage_label="Asking cloud model.",
-                model_name="kimi-k2.6:cloud",
+                model_name="kimi-k2.5:cloud",
                 user_text="prompt",
                 system_prompt="system",
                 timeout_seconds=10,
