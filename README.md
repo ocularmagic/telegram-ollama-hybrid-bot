@@ -38,7 +38,7 @@ By default, the repo is configured as:
 - **Local model 2:** disabled
 - **Image generation:** local ComfyUI workflow, configured with `COMFYUI_WORKFLOW_PATH`
 - **Grok commands:** `grok-4.20-multi-agent-0309` through xAI Responses API for testing a flagship LLM path
-- **Final synthesis / single-model answers:** `kimi-k2.5:cloud`
+- **Final synthesis / single-model answers:** `qwen3:14b`
 
 ## Why this project is useful
 
@@ -68,12 +68,12 @@ ministral-3:8b
   |
 Local answer
   |
-kimi-k2.5:cloud
+qwen3:14b
   |
 Final synthesis
 ```
 
-For `/ask`, the local-review stage is skipped and the shared search pool goes directly to Kimi K2.5. For `/asknosearch`, the retrieval stage is replaced by a no-search context block and Kimi K2.5 answers directly from model knowledge. For `/askmulti`, the full local-plus-cloud synthesis path is used.
+For `/ask`, the local-review stage is skipped and the shared search pool goes directly to Qwen3 14B. For `/asknosearch`, the retrieval stage is replaced by a no-search context block and Qwen3 14B answers directly from model knowledge. For `/askmulti`, the full local-plus-cloud synthesis path is used.
 
 ## Requirements
 
@@ -83,25 +83,11 @@ For `/ask`, the local-review stage is skipped and the shared search pool goes di
 - An Exa API key or Tavily API key
 - Enough local hardware to run your chosen local model
 
-If you keep the default cloud model as `kimi-k2.5:cloud`, sign in locally with:
+If you keep the default main model as `qwen3:14b`, pull it locally with:
 
 ```bash
-ollama signin
+ollama pull qwen3:14b
 ```
-
-To verify that your local Ollama session can access the cloud model, run either:
-
-```bash
-ollama pull kimi-k2.5:cloud
-```
-
-or:
-
-```bash
-ollama run kimi-k2.5:cloud
-```
-
-If that succeeds, the bot should be able to use `kimi-k2.5:cloud` through your local Ollama installation.
 
 ## Quick start
 
@@ -186,13 +172,13 @@ Shows a short help message.
 Shows model assignments, timeout settings, search-pool limits, memory status, recent Exa/Tavily usage, and the most recent request timing/prompt-size metrics.
 
 ### `/ask your question`
-Runs live search and sends the shared search context directly to the latest cloud model, currently `kimi-k2.5:cloud`.
+Runs live search and sends the shared search context directly to the main local model, currently `qwen3:14b`.
 
 ### `/askmulti your question`
 Runs the full hybrid workflow with live search, local-model review, and final cloud synthesis.
 
 ### `/asknosearch your question`
-Skips internet search and sends the question plus recent chat context directly to the latest cloud model, currently `kimi-k2.5:cloud`.
+Skips internet search and sends the question plus recent chat context directly to the main local model, currently `qwen3:14b`.
 
 ### `/image your image prompt`
 Queues the prompt in your local ComfyUI workflow and sends all generated output images back to Telegram.
@@ -327,6 +313,7 @@ Useful knobs in `bot.py`:
 - `XAI_MODEL`
 - `XAI_TIMEOUT_SECONDS`
 - `CLOUD_FINAL_MAX_ATTEMPTS`
+- `OLLAMA_NUM_CTX`
 - `SEARCH_QUERY_LIMIT`
 - `SEARCH_RESULTS_PER_QUERY`
 - `TOTAL_CANDIDATE_LIMIT`
@@ -363,13 +350,14 @@ Recent project updates include:
 - Added `/image` for local ComfyUI image generation using a configurable API-format workflow.
 - Added `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX` so the bot can wrap Telegram image prompts with fixed style text.
 - Added `/grok` and `/groksearch` for testing a flagship xAI LLM path, with `/groksearch` sending the web search tool array on every request.
-- Switched the default cloud model back to `kimi-k2.5:cloud`.
+- Switched the default main model to `qwen3:14b`.
 - Added Exa as the primary retrieval provider, using the official `exa-py` SDK.
 - Kept Tavily as fallback behind Exa and Ollama web search as an optional fallback.
 - Increased search breadth to support up to two planned queries and up to 20 results per query.
 - Added a trimmed local-only evidence pool so local models do not have to process the entire broad pool.
 - Increased the local-model timeout to `600s`.
 - Added a retry for transient cloud final-synthesis failures, controlled by `CLOUD_FINAL_MAX_ATTEMPTS`.
+- Added an `OLLAMA_NUM_CTX` cap so local Ollama calls do not try to allocate the model's full max context window by default.
 - Added per-stage timing and prompt-size diagnostics, visible in `/status`.
 - Added safer Telegram message chunking and transient timeout handling for status-message edits.
 - Added tests for search planning, Exa/Tavily fallback behavior, command routing, prompt metrics, and Telegram formatting.
@@ -381,6 +369,7 @@ Default values:
 - evidence/search stage: `300s`
 - local model stage: `600s`
 - final synthesis stage: `600s`
+- Ollama context cap: `16384`
 
 That gives hard prompts room to finish, while the heartbeat updates keep Telegram users informed.
 

@@ -32,7 +32,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "ministral-3:8b").strip()
 LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "").strip()
-CLOUD_MODEL = os.getenv("CLOUD_MODEL", "kimi-k2.5:cloud")
+CLOUD_MODEL = os.getenv("CLOUD_MODEL", "qwen3:14b")
 SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", LOCAL_MODEL_1)
 SEARCH_RETRIEVAL_MODEL = os.getenv("SEARCH_RETRIEVAL_MODEL", "tavily-search")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot_username")
@@ -63,6 +63,7 @@ EVIDENCE_TIMEOUT_SECONDS = int(os.getenv("EVIDENCE_TIMEOUT_SECONDS", "300"))
 LOCAL_MODEL_TIMEOUT_SECONDS = int(os.getenv("LOCAL_MODEL_TIMEOUT_SECONDS", "600"))
 FINAL_TIMEOUT_SECONDS = int(os.getenv("FINAL_TIMEOUT_SECONDS", "600"))
 CLOUD_FINAL_MAX_ATTEMPTS = max(1, int(os.getenv("CLOUD_FINAL_MAX_ATTEMPTS", "2")))
+OLLAMA_NUM_CTX = max(2048, int(os.getenv("OLLAMA_NUM_CTX", "16384")))
 
 SEARCH_QUERY_LIMIT = int(os.getenv("SEARCH_QUERY_LIMIT", "2"))
 SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "20"))
@@ -2136,9 +2137,19 @@ def call_ollama_model(model_name: str, user_text: str, system_prompt: str) -> st
     response = chat(
         model=model_name,
         messages=messages,
+        options={"num_ctx": OLLAMA_NUM_CTX},
     )
 
     return (response.message.content or "").strip() or "No response."
+
+
+def is_retryable_ollama_error(error: Exception) -> bool:
+    match = re.search(r"status code:\s*(\d+)", str(error), flags=re.IGNORECASE)
+    if not match:
+        return True
+
+    status_code = int(match.group(1))
+    return status_code not in {400, 401, 403, 404}
 
 
 def build_local_prompt(question: str, recent_chat_context: str, shared_pool: str) -> str:
@@ -2707,7 +2718,7 @@ async def run_ollama_step(
             return "", f"{stage_label} timed out after {timeout_seconds} seconds."
         except Exception as e:
             elapsed = time.monotonic() - started_at
-            if attempt < max_attempts:
+            if attempt < max_attempts and is_retryable_ollama_error(e):
                 logger.warning(
                     "Stage timing | stage=%s model=%s outcome=error elapsed=%.2fs attempt=%s/%s error=%s; retrying",
                     stage_key,
@@ -3043,7 +3054,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Heartbeat interval: {HEARTBEAT_SECONDS}s\n"
         f"Evidence timeout: {EVIDENCE_TIMEOUT_SECONDS}s\n"
         f"Local model timeout: {LOCAL_MODEL_TIMEOUT_SECONDS}s\n"
-        f"Final timeout: {FINAL_TIMEOUT_SECONDS}s\n\n"
+        f"Final timeout: {FINAL_TIMEOUT_SECONDS}s\n"
+        f"Ollama num_ctx: {OLLAMA_NUM_CTX}\n\n"
         f"Cloud final max attempts: {CLOUD_FINAL_MAX_ATTEMPTS}\n\n"
         f"{timing_text}\n\n"
         f"{format_today_search_stats()}\n\n"
