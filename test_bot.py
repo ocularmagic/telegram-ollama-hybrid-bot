@@ -928,6 +928,16 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIn("Answer directly from the shared context below.", prompt)
         self.assertIn("Store hours and location details.", prompt)
 
+    def test_call_ollama_model_passes_num_ctx_option(self):
+        response = MagicMock()
+        response.message.content = "hello"
+
+        with patch("bot.chat", return_value=response) as mock_chat:
+            text = bot.call_ollama_model("ministral-3:8b", "user prompt", "system prompt")
+
+        self.assertEqual(text, "hello")
+        self.assertEqual(mock_chat.call_args.kwargs["options"]["num_ctx"], bot.OLLAMA_NUM_CTX)
+
     def test_record_stage_duration_and_format_summary(self):
         stage_state = {"durations": {}}
 
@@ -1030,6 +1040,38 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(error)
         self.assertEqual(mock_call.call_count, 2)
         self.assertEqual(mock_sleep.await_count, 1)
+
+    async def test_run_ollama_step_does_not_retry_non_retryable_403(self):
+        status_message = MagicMock()
+        status_message.text = "old"
+        status_message.edit_text = AsyncMock()
+        stage_state = {
+            "stage": "starting",
+            "started_at": bot.time.monotonic(),
+            "completed_stages": set(),
+            "skipped_stages": set(),
+        }
+
+        with patch(
+            "bot.call_ollama_model",
+            side_effect=RuntimeError("this model requires a subscription (status code: 403)"),
+        ) as mock_call, patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            answer, error = await bot.run_ollama_step(
+                status_message=status_message,
+                stage_state=stage_state,
+                stage_key="final",
+                stage_label="Asking cloud model.",
+                model_name="kimi-k2.5:cloud",
+                user_text="prompt",
+                system_prompt="system",
+                timeout_seconds=10,
+                max_attempts=2,
+            )
+
+        self.assertEqual(answer, "")
+        self.assertIn("status code: 403", error)
+        self.assertEqual(mock_call.call_count, 1)
+        self.assertEqual(mock_sleep.await_count, 0)
 
     async def test_reply_text_in_chunks_splits_long_plaintext_messages(self):
         message = MagicMock()
