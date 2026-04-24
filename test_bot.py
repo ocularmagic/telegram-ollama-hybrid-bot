@@ -611,6 +611,17 @@ class BotHelpersTest(unittest.TestCase):
 
         self.assertIn("Exa estimated cost: $0.0070", notice)
 
+    def test_build_search_failure_notice_warns_when_live_search_has_no_evidence(self):
+        notice = bot.build_search_failure_notice(
+            {
+                "retrieval_mode": "Search pool unavailable",
+                "candidate_count": 0,
+            }
+        )
+
+        self.assertIn("Live search did not return usable evidence", notice)
+        self.assertIn("Retrieval mode: Search pool unavailable", notice)
+
     def test_build_shared_search_pool_uses_cache_on_repeat_request(self):
         plan = {
             "search_objective": "Test objective",
@@ -922,10 +933,13 @@ class BotHelpersTest(unittest.TestCase):
             question="What time does Costco close today?",
             recent_chat_context="None",
             shared_pool="Store hours and location details.",
+            has_live_search_evidence=True,
         )
 
         self.assertIn("SINGLE MODEL ANSWER GOAL:", prompt)
         self.assertIn("Answer directly from the shared context below.", prompt)
+        self.assertIn("GROUNDING STATE:", prompt)
+        self.assertIn("Live search returned usable evidence.", prompt)
         self.assertIn("Store hours and location details.", prompt)
 
     def test_call_ollama_model_passes_num_ctx_option(self):

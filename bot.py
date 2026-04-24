@@ -2202,8 +2202,18 @@ BROAD SHARED SEARCH POOL:
 """
 
 
-def build_single_model_prompt(question: str, recent_chat_context: str, shared_pool: str) -> str:
+def build_single_model_prompt(
+    question: str,
+    recent_chat_context: str,
+    shared_pool: str,
+    has_live_search_evidence: bool,
+) -> str:
     current_date_context = build_current_date_context()
+    grounding_note = (
+        "Live search returned usable evidence. Ground factual claims in the shared context block and cite sources inline."
+        if has_live_search_evidence
+        else "Live search did not return usable evidence. Say that clearly, avoid pretending the search succeeded, and do not fall back to generic knowledge-cutoff disclaimers unless the user explicitly asks about model limitations."
+    )
     return f"""{current_date_context}
 
 RECENT CHAT CONTEXT:
@@ -2214,6 +2224,9 @@ CURRENT USER QUESTION:
 
 SINGLE MODEL ANSWER GOAL:
 Answer directly from the shared context below. If the context is from live search, use it as the primary grounding. If the context is from the no-search path, answer from general model knowledge and note uncertainty when helpful.
+
+GROUNDING STATE:
+{grounding_note}
 
 SHARED CONTEXT BLOCK:
 {shared_pool}
@@ -2291,6 +2304,35 @@ def format_progress_text(stage_state: dict) -> str:
         lines.extend(["", f"Now: {detail}"])
 
     return "\n".join(lines)
+
+
+def search_metrics_have_live_evidence(metrics: dict) -> bool:
+    if not metrics:
+        return False
+
+    retrieval_mode = str(metrics.get("retrieval_mode", "") or "")
+    if retrieval_mode == "Search skipped by user request":
+        return False
+
+    return int(metrics.get("candidate_count", 0) or 0) > 0
+
+
+def build_search_failure_notice(metrics: dict) -> str | None:
+    if not metrics:
+        return "Live search did not return usable evidence for this request."
+
+    retrieval_mode = str(metrics.get("retrieval_mode", "unknown") or "unknown")
+    if retrieval_mode == "Search skipped by user request":
+        return None
+
+    if int(metrics.get("candidate_count", 0) or 0) > 0:
+        return None
+
+    return (
+        "Live search did not return usable evidence for this request.\n"
+        f"Retrieval mode: {retrieval_mode}\n"
+        "The answer below may be weak. Try rephrasing the question, checking your search provider/API limits, or using /askmulti."
+    )
 
 
 def record_stage_duration(stage_state: dict, stage_key: str, elapsed_seconds: float) -> None:
@@ -2832,7 +2874,7 @@ async def prepare_shared_pool(
         search_metrics.get("candidate_count", 0),
         search_metrics.get("executed_queries", []),
     )
-    return shared_pool, local_shared_pool, notices
+    return shared_pool, local_shared_pool, notices, search_metrics
 
 
 async def orchestrate_answer(question: str, recent_chat_context: str, status_message, force_no_search: bool = False):
@@ -2847,7 +2889,7 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
     heartbeat_task = asyncio.create_task(progress_heartbeat(status_message, stage_state, stop_event))
 
     try:
-        shared_pool, local_shared_pool, notices = await prepare_shared_pool(
+        shared_pool, local_shared_pool, notices, _search_metrics = await prepare_shared_pool(
             question=question,
             recent_chat_context=recent_chat_context,
             status_message=status_message,
@@ -2969,7 +3011,7 @@ async def orchestrate_single_model_answer(
     heartbeat_task = asyncio.create_task(progress_heartbeat(status_message, stage_state, stop_event))
 
     try:
-        shared_pool, _local_shared_pool, notices = await prepare_shared_pool(
+        shared_pool, _local_shared_pool, notices, search_metrics = await prepare_shared_pool(
             question=question,
             recent_chat_context=recent_chat_context,
             status_message=status_message,
@@ -2979,7 +3021,16 @@ async def orchestrate_single_model_answer(
         )
         record_prompt_metrics(stage_state, "shared_pool", shared_pool)
 
-        single_prompt = build_single_model_prompt(question, recent_chat_context, shared_pool)
+        search_failure_notice = build_search_failure_notice(search_metrics)
+        if search_failure_notice:
+            notices.append(search_failure_notice)
+
+        single_prompt = build_single_model_prompt(
+            question,
+            recent_chat_context,
+            shared_pool,
+            has_live_search_evidence=search_metrics_have_live_evidence(search_metrics),
+        )
         record_prompt_metrics(stage_state, "single_prompt", single_prompt)
         logger.info(
             "Prompt metrics | mode=single shared_pool=%sc single_prompt=%sc",
