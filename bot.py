@@ -32,7 +32,8 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 LOCAL_MODEL_1 = os.getenv("LOCAL_MODEL_1", "ministral-3:8b").strip()
 LOCAL_MODEL_2 = os.getenv("LOCAL_MODEL_2", "").strip()
-CLOUD_MODEL = os.getenv("CLOUD_MODEL", "qwen3:14b")
+# CLOUD_MODEL is accepted as a legacy alias for existing .env files.
+FINAL_MODEL = os.getenv("FINAL_MODEL", os.getenv("CLOUD_MODEL", "qwen3:14b")).strip()
 SEARCH_PLANNER_MODEL = os.getenv("SEARCH_PLANNER_MODEL", LOCAL_MODEL_1)
 SEARCH_RETRIEVAL_MODEL = os.getenv("SEARCH_RETRIEVAL_MODEL", "tavily-search")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot_username")
@@ -62,7 +63,7 @@ TAVILY_MAX_QUERY_CHARS = int(os.getenv("TAVILY_MAX_QUERY_CHARS", "400"))
 EVIDENCE_TIMEOUT_SECONDS = int(os.getenv("EVIDENCE_TIMEOUT_SECONDS", "300"))
 LOCAL_MODEL_TIMEOUT_SECONDS = int(os.getenv("LOCAL_MODEL_TIMEOUT_SECONDS", "600"))
 FINAL_TIMEOUT_SECONDS = int(os.getenv("FINAL_TIMEOUT_SECONDS", "600"))
-CLOUD_FINAL_MAX_ATTEMPTS = max(1, int(os.getenv("CLOUD_FINAL_MAX_ATTEMPTS", "2")))
+FINAL_MAX_ATTEMPTS = max(1, int(os.getenv("FINAL_MAX_ATTEMPTS", os.getenv("CLOUD_FINAL_MAX_ATTEMPTS", "2"))))
 OLLAMA_NUM_CTX = max(2048, int(os.getenv("OLLAMA_NUM_CTX", "16384")))
 
 SEARCH_QUERY_LIMIT = int(os.getenv("SEARCH_QUERY_LIMIT", "2"))
@@ -96,7 +97,7 @@ PROGRESS_STAGES = [
     ("planning", "Planning search"),
     ("search_pool", "Gathering evidence"),
     *[(stage_key, f"Running {model_name}") for stage_key, model_name in LOCAL_MODEL_STAGES],
-    ("final", f"Running {CLOUD_MODEL}"),
+    ("final", f"Running {FINAL_MODEL}"),
     ("sending", "Sending answer"),
 ]
 
@@ -118,7 +119,7 @@ Your job:
 Keep the answer concise but useful.
 """
 
-CLOUD_FINAL_SYSTEM_PROMPT = """You are a precise, high-trust AI assistant producing the final synthesis answer.
+FINAL_SYSTEM_PROMPT = """You are a precise, high-trust AI assistant producing the final synthesis answer.
 
 You will receive:
 - the user's current question
@@ -2254,7 +2255,7 @@ def build_fallback_answer(
             "Differences:\n"
             "Cloud synthesis failed, so this is a fallback response.",
             "Final answer:\n"
-            f"I could not complete the cloud synthesis step.\n"
+            f"I could not complete the final synthesis step.\n"
             f"Cloud error: {final_error}",
             f"Question:\n{question}",
             f"Broad shared search pool:\n{shared_pool}",
@@ -2959,12 +2960,12 @@ async def orchestrate_answer(question: str, recent_chat_context: str, status_mes
             status_message=status_message,
             stage_state=stage_state,
             stage_key="final",
-            stage_label=f"Asking {CLOUD_MODEL} to produce the final answer.",
-            model_name=CLOUD_MODEL,
+            stage_label=f"Asking {FINAL_MODEL} to produce the final answer.",
+            model_name=FINAL_MODEL,
             user_text=final_prompt,
-            system_prompt=CLOUD_FINAL_SYSTEM_PROMPT,
+            system_prompt=FINAL_SYSTEM_PROMPT,
             timeout_seconds=FINAL_TIMEOUT_SECONDS,
-            max_attempts=CLOUD_FINAL_MAX_ATTEMPTS,
+            max_attempts=FINAL_MAX_ATTEMPTS,
         )
 
         if final_error:
@@ -3043,16 +3044,16 @@ async def orchestrate_single_model_answer(
             status_message=status_message,
             stage_state=stage_state,
             stage_key="final",
-            stage_label=f"Asking {CLOUD_MODEL} for the single-model answer.",
-            model_name=CLOUD_MODEL,
+            stage_label=f"Asking {FINAL_MODEL} for the single-model answer.",
+            model_name=FINAL_MODEL,
             user_text=single_prompt,
             system_prompt=SINGLE_MODEL_SYSTEM_PROMPT,
             timeout_seconds=FINAL_TIMEOUT_SECONDS,
-            max_attempts=CLOUD_FINAL_MAX_ATTEMPTS,
+            max_attempts=FINAL_MAX_ATTEMPTS,
         )
 
         if final_error:
-            logger.warning("Single-model cloud answer failed, building fallback answer: %s", final_error)
+            logger.warning("Single-model final answer failed, building fallback answer: %s", final_error)
             final_answer = build_single_model_fallback_answer(
                 question=question,
                 shared_pool=shared_pool,
@@ -3094,7 +3095,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Exa search type: {EXA_SEARCH_TYPE}\n"
         f"Local model 1: {LOCAL_MODEL_1}\n"
         f"Local model 2: {LOCAL_MODEL_2 or 'disabled'}\n"
-        f"Cloud model: {CLOUD_MODEL}\n"
+        f"Final answer model: {FINAL_MODEL}\n"
         f"xAI model: {XAI_MODEL}\n"
         f"Search query limit: {SEARCH_QUERY_LIMIT}\n"
         f"Search results per query: {SEARCH_RESULTS_PER_QUERY}\n"
@@ -3107,7 +3108,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Local model timeout: {LOCAL_MODEL_TIMEOUT_SECONDS}s\n"
         f"Final timeout: {FINAL_TIMEOUT_SECONDS}s\n"
         f"Ollama num_ctx: {OLLAMA_NUM_CTX}\n\n"
-        f"Cloud final max attempts: {CLOUD_FINAL_MAX_ATTEMPTS}\n\n"
+        f"Final max attempts: {FINAL_MAX_ATTEMPTS}\n\n"
         f"{timing_text}\n\n"
         f"{format_today_search_stats()}\n\n"
         f"{AVAILABLE_COMMANDS_TEXT}"
