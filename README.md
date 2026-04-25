@@ -2,15 +2,15 @@
 
 A command-only Telegram bot that separates search planning, retrieval, local model judgment, and final synthesis into a practical workflow, with explicit single-model and multi-model answer modes.
 
-This repo is for builders who want to learn how a hybrid local + cloud system behaves in the real world, not just how to call one model once.
+This repo is for builders who want to learn how a hybrid local multi-model system behaves in the real world, not just how to call one model once.
 
 ## What it does
 
 The bot has three main answer paths:
 
-- `/ask ...` always performs live search and answers with the single latest cloud model.
-- `/askmulti ...` always performs live search and uses both the local model and the cloud model.
-- `/asknosearch ...` skips internet search and answers with the single latest cloud model.
+- `/ask ...` always performs live search and answers with the configured final model.
+- `/askmulti ...` always performs live search and uses local-model review plus final synthesis.
+- `/asknosearch ...` skips internet search and answers with the configured final model.
 - `/image ...` generates an image locally through a ComfyUI workflow.
 - `/grok ...` uses xAI Grok without search tools for testing a flagship LLM path.
 - `/groksearch ...` uses xAI Grok with the web search tool array enabled for testing a flagship LLM path.
@@ -21,14 +21,14 @@ When a request uses the multi-model live-search workflow, the bot:
 2. Uses **Exa or Tavily live web search** to collect a broad shared candidate pool.
 3. Captures per-query summaries and cited web sources for extra context.
 4. Sends a trimmed local-only evidence pool to **one local model by default**.
-5. Sends the broad evidence pool plus the local answer to **one cloud model**.
+5. Sends the broad evidence pool plus the local answer to **one final synthesis model**.
 6. Returns a final answer with staged progress updates in Telegram.
 
-When a user runs `/ask ...`, the bot plans search queries, gathers evidence, and sends the shared search context straight to the latest cloud model for a single-model answer.
+When a user runs `/ask ...`, the bot plans search queries, gathers evidence, and sends the shared search context straight to the configured final model for a single-model answer.
 
-When a user runs `/askmulti ...`, the bot runs the broader two-model pipeline: local model review first, then cloud synthesis.
+When a user runs `/askmulti ...`, the bot runs the broader two-model pipeline: local model review first, then final synthesis.
 
-When a user runs `/asknosearch ...`, the bot skips web retrieval entirely and asks the latest cloud model to answer from general model knowledge.
+When a user runs `/asknosearch ...`, the bot skips web retrieval entirely and asks the configured final model to answer from general model knowledge.
 
 By default, the repo is configured as:
 
@@ -44,7 +44,7 @@ By default, the repo is configured as:
 
 This is a good learning repo if you want hands-on experience with:
 
-- local vs. cloud model orchestration
+- local multi-model orchestration
 - retrieval separated from reasoning
 - broad shared evidence pools
 - follow-up memory in chat workflows
@@ -73,7 +73,7 @@ qwen3:14b
 Final synthesis
 ```
 
-For `/ask`, the local-review stage is skipped and the shared search pool goes directly to Qwen3 14B. For `/asknosearch`, the retrieval stage is replaced by a no-search context block and Qwen3 14B answers directly from model knowledge. For `/askmulti`, the full local-plus-cloud synthesis path is used.
+For `/ask`, the local-review stage is skipped and the shared search pool goes directly to Qwen3 14B. For `/asknosearch`, the retrieval stage is replaced by a no-search context block and Qwen3 14B answers directly from model knowledge. For `/askmulti`, the full local-review plus final-synthesis path is used.
 
 ## Requirements
 
@@ -175,7 +175,7 @@ Shows model assignments, timeout settings, search-pool limits, memory status, re
 Runs live search and sends the shared search context directly to the main local model, currently `qwen3:14b`.
 
 ### `/askmulti your question`
-Runs the full hybrid workflow with live search, local-model review, and final cloud synthesis.
+Runs the full hybrid workflow with live search, local-model review, and final synthesis.
 
 ### `/asknosearch your question`
 Skips internet search and sends the question plus recent chat context directly to the main local model, currently `qwen3:14b`.
@@ -312,7 +312,8 @@ Useful knobs in `bot.py`:
 - `XAI_BASE_URL`
 - `XAI_MODEL`
 - `XAI_TIMEOUT_SECONDS`
-- `CLOUD_FINAL_MAX_ATTEMPTS`
+- `FINAL_MODEL`
+- `FINAL_MAX_ATTEMPTS`
 - `OLLAMA_NUM_CTX`
 - `SEARCH_QUERY_LIMIT`
 - `SEARCH_RESULTS_PER_QUERY`
@@ -330,9 +331,9 @@ It also keeps daily search stats on disk so `/status` can show recent Exa/Tavily
 
 ### Current command behavior
 
-- `/ask` always searches and answers with the single latest cloud model.
-- `/askmulti` always searches and uses both the local model and the cloud model.
-- `/asknosearch` always skips internet search and answers with the single latest cloud model.
+- `/ask` always searches and answers with the configured final model.
+- `/askmulti` always searches and uses local-model review plus final synthesis.
+- `/asknosearch` always skips internet search and answers with the configured final model.
 - `/image` calls the local ComfyUI API, queues the configured workflow, fetches all generated images from ComfyUI history, and sends them back to Telegram.
 - `/grok` calls xAI's Responses API without tools as a flagship LLM test path, includes only Grok-command history as context, and returns the response directly to Telegram.
 - `/groksearch` calls xAI's Responses API with the `web_search` tool included in the `tools` array every time as a flagship LLM test path, includes only Grok-command history as context, and returns the response directly to Telegram.
@@ -344,9 +345,9 @@ Recent project updates include:
 
 - Switched from two local review models to one default local model: `ministral-3:8b`.
 - Disabled `LOCAL_MODEL_2` by default while keeping the second local slot optional in code.
-- Changed `/ask` into the explicit single-model live-search command using the latest cloud model.
+- Changed `/ask` into the explicit single-model live-search command using the configured final model.
 - Added `/askmulti` as the explicit multi-model live-search command.
-- Kept `/asknosearch` as the explicit forced no-search command using the latest cloud model.
+- Kept `/asknosearch` as the explicit forced no-search command using the configured final model.
 - Added `/image` for local ComfyUI image generation using a configurable API-format workflow.
 - Added `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX` so the bot can wrap Telegram image prompts with fixed style text.
 - Added `/grok` and `/groksearch` for testing a flagship xAI LLM path, with `/groksearch` sending the web search tool array on every request.
@@ -356,7 +357,7 @@ Recent project updates include:
 - Increased search breadth to support up to two planned queries and up to 20 results per query.
 - Added a trimmed local-only evidence pool so local models do not have to process the entire broad pool.
 - Increased the local-model timeout to `600s`.
-- Added a retry for transient cloud final-synthesis failures, controlled by `CLOUD_FINAL_MAX_ATTEMPTS`.
+- Added a retry for transient final-synthesis failures, controlled by `FINAL_MAX_ATTEMPTS`.
 - Added an `OLLAMA_NUM_CTX` cap so local Ollama calls do not try to allocate the model's full max context window by default.
 - Added per-stage timing and prompt-size diagnostics, visible in `/status`.
 - Added safer Telegram message chunking and transient timeout handling for status-message edits.

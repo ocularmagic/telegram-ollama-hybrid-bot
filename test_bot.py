@@ -882,14 +882,14 @@ class BotHelpersTest(unittest.TestCase):
         self.assertIs(bot.get_chat_lock(1), bot.get_chat_lock(1))
         self.assertIsNot(bot.get_chat_lock(1), bot.get_chat_lock(2))
 
-    def test_cloud_final_system_prompt_prefers_detailed_synthesis(self):
-        self.assertIn("Default to a thorough answer unless the user explicitly asks for something brief.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
-        self.assertIn("Treat the local model answers as inputs, not as the finished product.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
-        self.assertIn("Prioritize correctness over speed or confidence.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
-        self.assertIn("Be explicit about uncertainty.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
-        self.assertIn("For factual claims based on the shared pool, cite the source inline", bot.CLOUD_FINAL_SYSTEM_PROMPT)
-        self.assertIn("Do not use Markdown headings like #, ##, or ###.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
-        self.assertIn("Output only the final user-facing answer.", bot.CLOUD_FINAL_SYSTEM_PROMPT)
+    def test_final_system_prompt_prefers_detailed_synthesis(self):
+        self.assertIn("Default to a thorough answer unless the user explicitly asks for something brief.", bot.FINAL_SYSTEM_PROMPT)
+        self.assertIn("Treat the local model answers as inputs, not as the finished product.", bot.FINAL_SYSTEM_PROMPT)
+        self.assertIn("Prioritize correctness over speed or confidence.", bot.FINAL_SYSTEM_PROMPT)
+        self.assertIn("Be explicit about uncertainty.", bot.FINAL_SYSTEM_PROMPT)
+        self.assertIn("For factual claims based on the shared pool, cite the source inline", bot.FINAL_SYSTEM_PROMPT)
+        self.assertIn("Do not use Markdown headings like #, ##, or ###.", bot.FINAL_SYSTEM_PROMPT)
+        self.assertIn("Output only the final user-facing answer.", bot.FINAL_SYSTEM_PROMPT)
 
     def test_build_final_prompt_requests_richer_final_response(self):
         prompt = bot.build_final_prompt(
@@ -1042,8 +1042,8 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
                 status_message=status_message,
                 stage_state=stage_state,
                 stage_key="final",
-                stage_label="Asking cloud model.",
-                model_name="kimi-k2.5:cloud",
+                stage_label="Asking final model.",
+                model_name="qwen3:14b",
                 user_text="prompt",
                 system_prompt="system",
                 timeout_seconds=10,
@@ -1074,8 +1074,8 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
                 status_message=status_message,
                 stage_state=stage_state,
                 stage_key="final",
-                stage_label="Asking cloud model.",
-                model_name="kimi-k2.5:cloud",
+                stage_label="Asking final model.",
+                model_name="qwen3:14b",
                 user_text="prompt",
                 system_prompt="system",
                 timeout_seconds=10,
