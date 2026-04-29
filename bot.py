@@ -191,8 +191,7 @@ AVAILABLE_COMMANDS_TEXT = (
     "/askmulti <question> - Search the web and use both models for the answer.\n"
     "/asknosearch <question> - Answer without internet search using the single latest model.\n"
     "/image <prompt> - Generate an image locally with ComfyUI.\n"
-    "/grok <question> - Ask Grok without search tools.\n"
-    "/groksearch <question> - Ask Grok with xAI web search tools enabled.\n"
+    "/grok <question> - Ask Grok with xAI web search tools enabled.\n"
     "/clear - Clear this chat's rolling memory."
 )
 
@@ -222,11 +221,10 @@ IMAGE_USAGE = (
 
 GROK_USAGE = (
     "Usage:\n"
-    "/grok your question here\n"
-    "/groksearch your question here\n\n"
+    "/grok your question here\n\n"
     "Example:\n"
     "/grok explain why TLS handshakes matter\n"
-    "/groksearch what are the top AI headlines today?"
+    "/grok what are the top AI headlines today?"
 )
 
 PENDING_SEARCH_DECISION_KEY = "pending_search_decision"
@@ -3417,10 +3415,6 @@ async def handle_grok_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle_grok_request(update, context, use_search=False)
-
-
-async def grok_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_grok_request(update, context, use_search=True)
 
 
@@ -3467,7 +3461,6 @@ def main() -> None:
     app.add_handler(CommandHandler("asknosearch", ask_no_search_command))
     app.add_handler(CommandHandler("image", image_command))
     app.add_handler(CommandHandler("grok", grok_command))
-    app.add_handler(CommandHandler("groksearch", grok_search_command))
     app.add_error_handler(application_error_handler)
 
     print("Bot is running. Press Ctrl+C to stop.")

@@ -109,7 +109,7 @@ class BotHelpersTest(unittest.TestCase):
 
     def test_grok_usage_mentions_grok_commands(self):
         self.assertIn("/grok your question here", bot.GROK_USAGE)
-        self.assertIn("/groksearch your question here", bot.GROK_USAGE)
+        self.assertNotIn("/groksearch your question here", bot.GROK_USAGE)
 
     def test_build_no_search_pool_marks_search_as_skipped(self):
         result = bot.build_no_search_pool("Explain TLS handshakes.", "None")
@@ -1184,7 +1184,7 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/asknosearch <question>", status_text)
         self.assertIn("/image <prompt>", status_text)
         self.assertIn("/grok <question>", status_text)
-        self.assertIn("/groksearch <question>", status_text)
+        self.assertNotIn("/groksearch <question>", status_text)
         self.assertNotIn("/fast <question>", status_text)
 
     async def test_handle_ask_request_defaults_to_single_model_search(self):
@@ -1287,17 +1287,7 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_photo.getvalue(), b"fake-png-1")
         self.assertEqual(second_photo.getvalue(), b"fake-png-2")
 
-    async def test_grok_search_command_enables_search_tools(self):
-        update = MagicMock()
-        context = MagicMock()
-
-        with patch("bot.handle_grok_request", new=AsyncMock()) as mock_handle:
-            await bot.grok_search_command(update, context)
-
-        self.assertEqual(mock_handle.await_count, 1)
-        self.assertTrue(mock_handle.await_args.kwargs["use_search"])
-
-    async def test_grok_command_disables_search_tools(self):
+    async def test_grok_command_enables_search_tools(self):
         update = MagicMock()
         context = MagicMock()
 
@@ -1305,7 +1295,7 @@ class BotFormattingAsyncTest(unittest.IsolatedAsyncioTestCase):
             await bot.grok_command(update, context)
 
         self.assertEqual(mock_handle.await_count, 1)
-        self.assertFalse(mock_handle.await_args.kwargs["use_search"])
+        self.assertTrue(mock_handle.await_args.kwargs["use_search"])
 
     async def test_handle_grok_request_uses_and_saves_grok_only_memory(self):
         update = MagicMock()
