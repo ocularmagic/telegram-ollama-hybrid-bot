@@ -12,8 +12,7 @@ The bot has three main answer paths:
 - `/askmulti ...` always performs live search and uses local-model review plus final synthesis.
 - `/asknosearch ...` skips internet search and answers with the configured final model.
 - `/image ...` generates an image locally through a ComfyUI workflow.
-- `/grok ...` uses xAI Grok without search tools for testing a flagship LLM path.
-- `/groksearch ...` uses xAI Grok with the web search tool array enabled for testing a flagship LLM path.
+- `/grok ...` uses xAI Grok with the web search tool array enabled.
 
 When a request uses the multi-model live-search workflow, the bot:
 
@@ -56,7 +55,7 @@ This is a good learning repo if you want hands-on experience with:
 ```text
 Telegram
   |
-Command-only bot (/ask, /askmulti, /asknosearch, /image, /grok, /groksearch, /status, /clear)
+Command-only bot (/ask, /askmulti, /asknosearch, /image, /grok, /status, /clear)
   |
 Local search planner model
   |
@@ -137,7 +136,7 @@ Optional variables:
 - `OLLAMA_API_KEY` if you want Ollama web-search fallback when Tavily is unavailable
 - `EXA_API_KEY` if you want Exa as the primary retrieval provider
 - `TAVILY_API_KEY` if you want Tavily as primary or as fallback behind Exa
-- `XAI_API_KEY` if you want to use `/grok` and `/groksearch`
+- `XAI_API_KEY` if you want to use `/grok`
 
 ### 5. Pull the default local model once
 
@@ -184,10 +183,7 @@ Skips internet search and sends the question plus recent chat context directly t
 Queues the prompt in your local ComfyUI workflow and sends all generated output images back to Telegram.
 
 ### `/grok your question`
-Sends the prompt directly to xAI using `grok-4.20-0309-non-reasoning` without search tools as a standalone fast Grok path. This command does not use the bot's search-decision logic, local model review, final synthesis, or regular `/ask` memory. It only includes previous `/grok` and `/groksearch` turns as Grok-only context.
-
-### `/groksearch your question`
-Sends the prompt directly to xAI using `grok-4.20-0309-non-reasoning` as a standalone fast Grok path and includes `tools: [{"type": "web_search"}]` on every request. It only includes previous `/grok` and `/groksearch` turns as Grok-only context; the response is returned directly to Telegram.
+Sends the prompt directly to xAI using `grok-4.20-0309-non-reasoning` as a standalone fast Grok path and includes `tools: [{"type": "web_search"}]` on every request. It only includes previous `/grok` turns as Grok-only context; the response is returned directly to Telegram.
 
 ### `/clear`
 Clears rolling memory for the current Telegram chat.
@@ -203,7 +199,7 @@ Recommended pattern in group chats:
 /asknosearch@your_bot_username explain TCP vs UDP from general knowledge
 /image@your_bot_username a photorealistic orange tabby cat wearing tiny aviator goggles
 /grok@your_bot_username explain quantum tunneling in plain language
-/groksearch@your_bot_username what are the latest AI headlines today?
+/grok@your_bot_username what are the latest AI headlines today?
 ```
 
 Keep Telegram **Privacy Mode ON** unless you intentionally want different bot behavior in groups.
@@ -336,8 +332,7 @@ It also keeps daily search stats on disk so `/status` can show recent Exa/Tavily
 - `/askmulti` always searches and uses local-model review plus final synthesis.
 - `/asknosearch` always skips internet search and answers with the configured final model.
 - `/image` calls the local ComfyUI API, queues the configured workflow, fetches all generated images from ComfyUI history, and sends them back to Telegram.
-- `/grok` calls xAI's Responses API without tools as a flagship LLM test path, includes only Grok-command history as context, and returns the response directly to Telegram.
-- `/groksearch` calls xAI's Responses API with the `web_search` tool included in the `tools` array every time as a flagship LLM test path, includes only Grok-command history as context, and returns the response directly to Telegram.
+- `/grok` calls xAI's Responses API with the `web_search` tool included in the `tools` array every time, includes only Grok-command history as context, and returns the response directly to Telegram.
 - `/clear` clears rolling chat memory for the chat.
 
 ## Changes Made
@@ -351,7 +346,7 @@ Recent project updates include:
 - Kept `/asknosearch` as the explicit forced no-search command using the configured final model.
 - Added `/image` for local ComfyUI image generation using a configurable ComfyUI workflow.
 - Added `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX` so the bot can wrap Telegram image prompts with fixed style text.
-- Added `/grok` and `/groksearch` for testing a flagship xAI LLM path, with `/groksearch` sending the web search tool array on every request.
+- Added `/grok` for testing a fast xAI LLM path with the web search tool array enabled on every request.
 - Switched the default main model to `qwen3:14b`.
 - Added Exa as the primary retrieval provider, using the official `exa-py` SDK.
 - Kept Tavily as fallback behind Exa and Ollama web search as an optional fallback.
