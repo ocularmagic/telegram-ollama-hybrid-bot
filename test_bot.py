@@ -700,6 +700,60 @@ class BotHelpersTest(unittest.TestCase):
 
         self.assertEqual(workflow["557"]["inputs"]["value"], "a cat")
 
+    def test_convert_comfyui_ui_workflow_to_api_maps_core_nodes(self):
+        workflow = bot.convert_comfyui_ui_workflow_to_api(
+            {
+                "nodes": [
+                    {
+                        "id": 4,
+                        "type": "CheckpointLoaderSimple",
+                        "inputs": [],
+                        "widgets_values": ["model.safetensors"],
+                    },
+                    {
+                        "id": 6,
+                        "type": "CLIPTextEncode",
+                        "inputs": [{"name": "clip", "link": 151}],
+                        "widgets_values": ["old prompt"],
+                    },
+                ],
+                "links": [[151, 4, 1, 6, 0, "CLIP"]],
+            }
+        )
+
+        self.assertEqual(workflow["4"]["inputs"]["ckpt_name"], "model.safetensors")
+        self.assertEqual(workflow["6"]["inputs"]["clip"], ["4", 1])
+        self.assertEqual(workflow["6"]["inputs"]["text"], "old prompt")
+
+    def test_apply_comfyui_prompt_updates_converted_ui_workflow(self):
+        original_node_id = bot.COMFYUI_PROMPT_NODE_ID
+        original_prompt_input = bot.COMFYUI_PROMPT_INPUT
+        bot.COMFYUI_PROMPT_NODE_ID = "6"
+        bot.COMFYUI_PROMPT_INPUT = "text"
+
+        try:
+            workflow = bot.apply_comfyui_prompt(
+                bot.normalize_comfyui_workflow(
+                    {
+                        "nodes": [
+                            {
+                                "id": 6,
+                                "type": "CLIPTextEncode",
+                                "inputs": [],
+                                "widgets_values": ["old prompt"],
+                            }
+                        ],
+                        "links": [],
+                    }
+                ),
+                "a cat",
+            )
+        finally:
+            bot.COMFYUI_PROMPT_NODE_ID = original_node_id
+            bot.COMFYUI_PROMPT_INPUT = original_prompt_input
+
+        self.assertEqual(workflow["6"]["inputs"]["text"], "a cat")
+
     def test_build_image_prompt_adds_prefix_and_suffix(self):
         original_prefix = bot.IMAGE_PROMPT_PREFIX
         original_suffix = bot.IMAGE_PROMPT_SUFFIX
