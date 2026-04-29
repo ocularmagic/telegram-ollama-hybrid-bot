@@ -52,7 +52,7 @@ IMAGE_PROMPT_CHARS = int(os.getenv("IMAGE_PROMPT_CHARS", "2000"))
 IMAGE_PROMPT_PREFIX = os.getenv("IMAGE_PROMPT_PREFIX", "")
 IMAGE_PROMPT_SUFFIX = os.getenv("IMAGE_PROMPT_SUFFIX", "")
 XAI_BASE_URL = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1").rstrip("/")
-XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.20-multi-agent-0309")
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.20-0309-non-reasoning")
 XAI_TIMEOUT_SECONDS = int(os.getenv("XAI_TIMEOUT_SECONDS", "1200"))
 
 MAX_TELEGRAM_CHUNK = 3500
@@ -1270,7 +1270,93 @@ def load_comfyui_workflow() -> dict:
 
     if not isinstance(workflow, dict):
         raise ImageGenerationError("ComfyUI workflow must be a JSON object in API format.")
+    workflow = normalize_comfyui_workflow(workflow)
     return workflow
+
+
+COMFYUI_WIDGET_INPUTS = {
+    "CheckpointLoaderSimple": ["ckpt_name"],
+    "CLIPSetLastLayer": ["stop_at_clip_layer"],
+    "CLIPTextEncode": ["text"],
+    "EmptyLatentImage": ["width", "height", "batch_size"],
+    "ImageScaleBy": ["upscale_method", "scale_by"],
+    "KSampler": [
+        "seed",
+        "control_after_generate",
+        "steps",
+        "cfg",
+        "sampler_name",
+        "scheduler",
+        "denoise",
+    ],
+    "LoadImage": ["image", "upload"],
+    "SaveImage": ["filename_prefix"],
+    "VAEDecodeTiled": ["tile_size", "overlap", "temporal_size", "temporal_overlap"],
+    "VAEEncodeTiled": ["tile_size", "overlap", "temporal_size", "temporal_overlap"],
+}
+
+
+def is_comfyui_api_workflow(workflow: dict) -> bool:
+    return any(
+        isinstance(node, dict) and "class_type" in node and isinstance(node.get("inputs"), dict)
+        for node in workflow.values()
+    )
+
+
+def is_comfyui_ui_workflow(workflow: dict) -> bool:
+    return isinstance(workflow.get("nodes"), list) and isinstance(workflow.get("links"), list)
+
+
+def normalize_comfyui_workflow(workflow: dict) -> dict:
+    if is_comfyui_api_workflow(workflow):
+        return workflow
+    if is_comfyui_ui_workflow(workflow):
+        return convert_comfyui_ui_workflow_to_api(workflow)
+    raise ImageGenerationError(
+        "ComfyUI workflow must be an API-format prompt JSON or a UI-format workflow with nodes and links."
+    )
+
+
+def convert_comfyui_ui_workflow_to_api(workflow: dict) -> dict:
+    links = {}
+    for link in workflow.get("links", []):
+        if isinstance(link, list) and len(link) >= 5:
+            link_id, source_node_id, source_slot, _target_node_id, _target_slot = link[:5]
+            links[link_id] = [str(source_node_id), source_slot]
+
+    api_workflow = {}
+    for node in workflow.get("nodes", []):
+        if not isinstance(node, dict) or "id" not in node or "type" not in node:
+            continue
+
+        node_id = str(node["id"])
+        class_type = node["type"]
+        inputs = {}
+
+        for input_info in node.get("inputs", []) or []:
+            if not isinstance(input_info, dict):
+                continue
+            input_name = input_info.get("name")
+            link_id = input_info.get("link")
+            if input_name and link_id in links:
+                inputs[input_name] = links[link_id]
+
+        widget_names = COMFYUI_WIDGET_INPUTS.get(class_type, [])
+        for input_name, value in zip(widget_names, node.get("widgets_values", []) or []):
+            inputs.setdefault(input_name, value)
+
+        api_workflow[node_id] = {
+            "class_type": class_type,
+            "inputs": inputs,
+        }
+        if isinstance(node.get("properties"), dict):
+            api_workflow[node_id]["_meta"] = {
+                "title": node["properties"].get("Node name for S&R", class_type)
+            }
+
+    if not api_workflow:
+        raise ImageGenerationError("Could not convert ComfyUI UI workflow to API format.")
+    return api_workflow
 
 
 def replace_prompt_placeholders(value, prompt: str):

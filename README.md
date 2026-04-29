@@ -37,7 +37,7 @@ By default, the repo is configured as:
 - **Local model 1:** `ministral-3:8b`
 - **Local model 2:** disabled
 - **Image generation:** local ComfyUI workflow, configured with `COMFYUI_WORKFLOW_PATH`
-- **Grok commands:** `grok-4.20-multi-agent-0309` through xAI Responses API for testing a flagship LLM path
+- **Grok commands:** `grok-4.20-0309-non-reasoning` through xAI Responses API for fast Grok replies
 - **Final synthesis / single-model answers:** `qwen3:14b`
 
 ## Why this project is useful
@@ -184,10 +184,10 @@ Skips internet search and sends the question plus recent chat context directly t
 Queues the prompt in your local ComfyUI workflow and sends all generated output images back to Telegram.
 
 ### `/grok your question`
-Sends the prompt directly to xAI using `grok-4.20-multi-agent-0309` without search tools as a standalone flagship LLM test path. This command does not use the bot's search-decision logic, local model review, Kimi synthesis, or regular `/ask` memory. It only includes previous `/grok` and `/groksearch` turns as Grok-only context.
+Sends the prompt directly to xAI using `grok-4.20-0309-non-reasoning` without search tools as a standalone fast Grok path. This command does not use the bot's search-decision logic, local model review, final synthesis, or regular `/ask` memory. It only includes previous `/grok` and `/groksearch` turns as Grok-only context.
 
 ### `/groksearch your question`
-Sends the prompt directly to xAI using `grok-4.20-multi-agent-0309` as a standalone flagship LLM test path and includes `tools: [{"type": "web_search"}]` on every request. It only includes previous `/grok` and `/groksearch` turns as Grok-only context; the response is returned directly to Telegram.
+Sends the prompt directly to xAI using `grok-4.20-0309-non-reasoning` as a standalone fast Grok path and includes `tools: [{"type": "web_search"}]` on every request. It only includes previous `/grok` and `/groksearch` turns as Grok-only context; the response is returned directly to Telegram.
 
 ### `/clear`
 Clears rolling memory for the current Telegram chat.
@@ -247,16 +247,17 @@ Current Windows desktop setup:
 
 - `COMFYUI_BASE_URL=http://127.0.0.1:8000`
 - `COMFYUI_WORKFLOW_PATH=comfyui_workflow_ui.json`
-- `COMFYUI_PROMPT_NODE_ID=557`
-- `COMFYUI_PROMPT_INPUT=value`
+- `COMFYUI_PROMPT_NODE_ID=6`
+- `COMFYUI_PROMPT_INPUT=text`
 
-The `comfyui_workflow_ui.json` file in this repo is a ComfyUI API-format workflow. In that workflow, node `557` is a `PrimitiveStringMultiline` node that feeds the positive prompt into the rest of the graph. The bot replaces that node’s `value` input with the text from Telegram.
+The `comfyui_workflow_ui.json` file in this repo is a ComfyUI UI-format workflow. The bot converts UI-format workflows to ComfyUI API prompt format before queueing them. In the current workflow, node `6` is the positive `CLIPTextEncode` node. The bot replaces that node's `text` input with the text from Telegram.
 
 How `/image` works:
 
 - It receives the Telegram prompt after `/image`.
 - It optionally wraps the prompt with `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX`.
 - It loads the workflow JSON from `COMFYUI_WORKFLOW_PATH`.
+- It converts UI-format workflows to API prompt format when needed.
 - It inserts the final prompt into the configured prompt node.
 - It queues the workflow through ComfyUI’s `/prompt` endpoint.
 - It polls ComfyUI’s `/history/{prompt_id}` endpoint.
@@ -348,7 +349,7 @@ Recent project updates include:
 - Changed `/ask` into the explicit single-model live-search command using the configured final model.
 - Added `/askmulti` as the explicit multi-model live-search command.
 - Kept `/asknosearch` as the explicit forced no-search command using the configured final model.
-- Added `/image` for local ComfyUI image generation using a configurable API-format workflow.
+- Added `/image` for local ComfyUI image generation using a configurable ComfyUI workflow.
 - Added `IMAGE_PROMPT_PREFIX` and `IMAGE_PROMPT_SUFFIX` so the bot can wrap Telegram image prompts with fixed style text.
 - Added `/grok` and `/groksearch` for testing a flagship xAI LLM path, with `/groksearch` sending the web search tool array on every request.
 - Switched the default main model to `qwen3:14b`.
